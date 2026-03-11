@@ -344,8 +344,13 @@ def post_process_rewards(args, samples, **kwargs):
         ]
 
         # Tokenize teacher prompt. add_generation_prompt=True keeps assistant turn open.
+        # enable_thinking=True ensures the teacher prompt ends with <think>\n, matching
+        # the student response tokens which also begin with <think> (student rollout uses
+        # enable_thinking=True). Without this, the teacher assigns lower probability to
+        # <think> as the first token, causing a systematic KL mismatch.
         teacher_prompt_text = tokenizer.apply_chat_template(
-            teacher_messages, tokenize=False, add_generation_prompt=True
+            teacher_messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=True
         )
         teacher_prompt_tokens = tokenizer.encode(teacher_prompt_text, add_special_tokens=False)
 

@@ -1,15 +1,39 @@
 #!/bin/bash
 
-# On-Policy Self-Distillation (OPSD) with full-vocabulary JSD loss
-# Usage: bash examples/on_policy_distillation/run-qwen3-8b-opsd.sh
+# On-Policy Self-Distillation (OPSD) with combined PG + JSD + Ref-KL loss
+# Usage: bash examples/on_policy_distillation/run-qwen3-8B-opsd.sh
 #
-# A single Qwen2.5-1.5B model acts as both teacher and student:
-#   - Student: generates on-policy rollouts from the normal prompt
-#   - Teacher: the SAME model conditioned on privileged context (prompt + ground-truth)
-#   - Objective: minimize full-vocabulary JSD between student and teacher distributions
+# A single Qwen3-8B model acts as both student and teacher:
+#   - Student:  generates on-policy rollouts from the ORIGINAL prompt
+#   - Teacher:  SAME model conditioned on a PRIVILEGED prompt
+#               (original problem + full reference solution, arXiv 2601.18734)
+#   - Objective (combined):
+#       L = pg_loss + α·JSD(student || teacher) + β·KL(student || ref)
 #
-# No external sglang teacher server is needed. The teacher forward pass happens
-# inside the training step using the same model weights (under torch.no_grad).
+# Key differences from pure-distillation (--opsd-pure-mode):
+#   - pg_loss is active (no --opsd-pure-mode)
+#   - Two KL terms act as soft regularisers alongside the RL signal
+#   - Dataset must have full reference solutions → use OpenThoughts-114k
+#
+# Teacher prompt format (--opsd-teacher-info-mode full):
+#   [original problem]
+#   Here is a reference solution: [reference_solution]
+#   After understanding the reference solution ... [transition prompt]
+#   [format_instruction]          ← SAME suffix as student prompt ✓
+#
+# Student prompt format (built by preprocess_dataset.py):
+#   [formatted problem with format_instruction suffix]
+#
+# Format instruction consistency:
+#   preprocess_dataset.py stores metadata['format_instruction'] for both.
+#   on_policy_self_distillation.py reads that same field for the teacher.
+#   Both student and teacher therefore end with the identical format suffix.
+#
+# Teacher sequence length budget (Qwen3-8B max_position_embeddings = 32768):
+#   teacher_prompt ≈ 1500–2600 tokens (problem + reference_solution + boilerplate)
+#   student_response ≤ --rollout-max-response-len = 4096
+#   teacher_total ≈ 5600–6700 tokens  →  well within 32 K ✓
+#   (--max-tokens-per-gpu is lowered to 2048 to leave room for teacher pass)
 #
 # Reference: "Self-Distilled Reasoner" (arXiv 2601.18734)
 
@@ -18,7 +42,6 @@ export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_NET_GDR_LEVEL=0
 export NCCL_DEBUG=INFO
-
 
 export PYTHONBUFFERED=16
 
@@ -33,161 +56,46 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 source "/root/slime_siqi/scripts/models/qwen3-8B.sh"
 
 ###############################################################################
-# Step 0: Build JSONL data from HuggingFace datasets
-#   - Train: open-thoughts/OpenThoughts-114k (metadata split)
-#   - Eval:  math-ai/aime25 (test split)
+# Step 0: Build JSONL data using the unified preprocess_dataset.py utility.
+#
+# We use open-thoughts/OpenThoughts-114k (config=metadata) because it supplies
+# full reference solutions (ground_truth_solution field).  These are needed for
+# --opsd-teacher-info-mode=full: the teacher prompt embeds the entire solution.
+#
+# DAPO-Math-17k is NOT suitable here: its "ground_truth" field is only the
+# final answer (no reasoning chain), so the teacher would receive almost no
+# privileged information.
+#
+# Format notes:
+#   --answer-format boxed   : student wraps final answer in \boxed{}
+#                             metadata['format_instruction'] = "Please reason
+#                             step by step, and put your final answer within
+#                             \boxed{}."
+#   The teacher prompt builder (on_policy_self_distillation.py) reads this
+#   same field and appends it verbatim → student & teacher format are identical.
 ###############################################################################
 
-python3 -c "
-import json
-import os
-import pathlib
+PREPROCESS="python3 examples/on_policy_distillation/preprocess_dataset.py"
 
-try:
-    from datasets import load_dataset
-except ImportError as e:
-    raise SystemExit('datasets package is required. Please run: pip install datasets') from e
+# ---- Training dataset -------------------------------------------------------
+TRAIN_DATASET="${TRAIN_DATASET:-open-thoughts/OpenThoughts-114k}"
+TRAIN_CONFIG="${TRAIN_CONFIG:-metadata}"
+TRAIN_OUT="/root/math/data/train_opsd_full.jsonl"
+TRAIN_ANSWER_FORMAT="${TRAIN_ANSWER_FORMAT:-boxed}"
 
-DATA_DIR = pathlib.Path('/root/math/data')
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+TRAIN_ARGS=(--dataset "$TRAIN_DATASET" --config "$TRAIN_CONFIG" --split train --output "$TRAIN_OUT" --answer-format "$TRAIN_ANSWER_FORMAT")
+$PREPROCESS "${TRAIN_ARGS[@]}"
 
-TRAIN_REPO = 'open-thoughts/OpenThoughts-114k'
-TRAIN_CONFIG = 'metadata'
-EVAL_REPO = 'math-ai/aime25'
-MAX_REFERENCE_SOLUTION_CHARS = int(os.environ.get('MAX_REFERENCE_SOLUTION_CHARS', '12000'))
+# ---- Eval dataset -----------------------------------------------------------
+EVAL_DATASET="${EVAL_DATASET:-math-ai/aime25}"
+EVAL_CONFIG="${EVAL_CONFIG:-}"
+EVAL_OUT="/root/math/data/eval_opsd_full.jsonl"
+MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-100}"
+EVAL_ANSWER_FORMAT="${EVAL_ANSWER_FORMAT:-boxed}"
 
-BOXED_INSTRUCTION = (
-    '\\n\\nPlease solve the problem step by step. '
-    'The last line must be of the form Answer: \\\\boxed{your_answer}.'
-)
-
-
-def normalize_text(v):
-    if v is None:
-        return ''
-    s = str(v).strip()
-    if s.lower() in {'nan', 'none', 'null'}:
-        return ''
-    return s
-
-print(f'Loading training dataset: {TRAIN_REPO} ({TRAIN_CONFIG})')
-train_ds = load_dataset(TRAIN_REPO, TRAIN_CONFIG, split='train')
-train_out = DATA_DIR / 'train_chat.jsonl'
-train_written = 0
-train_ref_truncated = 0
-with train_out.open('w', encoding='utf-8') as fout:
-    for row in train_ds:
-        problem = normalize_text(row.get('problem'))
-        if not problem:
-            continue
-
-        # Use ground-truth solution directly for both privileged info and grading label.
-        ground_truth_solution = normalize_text(row.get('ground_truth_solution'))
-        reference_solution = ground_truth_solution
-        if not reference_solution:
-            continue
-        if len(reference_solution) > MAX_REFERENCE_SOLUTION_CHARS:
-            reference_solution = reference_solution[:MAX_REFERENCE_SOLUTION_CHARS] + '\n\n[TRUNCATED]'
-            train_ref_truncated += 1
-
-        final_answer = ground_truth_solution
-        label = ground_truth_solution
-        if not label:
-            continue
-
-        entry = {
-            'prompt': [{'role': 'user', 'content': problem + BOXED_INSTRUCTION}],
-            'label': label,
-            'metadata': {
-                'solution': final_answer or reference_solution,
-                'reference_solution': reference_solution,
-                'final_answer': final_answer,
-                'raw_problem': problem,
-                'domain': normalize_text(row.get('domain')),
-                'source': normalize_text(row.get('source')),
-            },
-        }
-        fout.write(json.dumps(entry, ensure_ascii=False) + '\n')
-        train_written += 1
-print(
-    f'Created {train_out} with {train_written} entries '
-    f'(reference_solution truncated={train_ref_truncated}, '
-    f'max_chars={MAX_REFERENCE_SOLUTION_CHARS})'
-)
-
-print(f'Loading eval dataset: {EVAL_REPO} (test)')
-eval_ds = load_dataset(EVAL_REPO, split='test')
-eval_out = DATA_DIR / 'test_chat.jsonl'
-eval_written = 0
-with eval_out.open('w', encoding='utf-8') as fout:
-    for row in eval_ds:
-        problem = normalize_text(row.get('problem'))
-        answer = normalize_text(row.get('answer'))
-        if not problem or not answer:
-            continue
-        entry = {
-            'prompt': [{'role': 'user', 'content': problem + BOXED_INSTRUCTION}],
-            'label': answer,
-            'metadata': {
-                'solution': answer,
-                'reference_solution': '',
-                'final_answer': answer,
-                'raw_problem': problem,
-                'id': normalize_text(row.get('id')),
-            },
-        }
-        fout.write(json.dumps(entry, ensure_ascii=False) + '\n')
-        eval_written += 1
-print(f'Created {eval_out} with {eval_written} entries')
-"
-
-###############################################################################
-# Preprocess data (add raw_content for OPSD, prepare eval data)
-###############################################################################
-
-# Add raw_content to metadata so the OPSD reward function can reconstruct
-# the privileged teacher prompt (original question + ground truth)
-python3 -c "
-import json, pathlib
-
-src = pathlib.Path('/root/math/data/train_chat.jsonl')
-dst = pathlib.Path('/root/math/data/train_opsd.jsonl')
-
-with src.open() as fin, dst.open('w') as fout:
-    for line in fin:
-        obj = json.loads(line)
-        metadata = obj.get('metadata') or {}
-        # Prefer raw_problem if provided by preprocessing; fallback to prompt text.
-        raw_content = metadata.get('raw_problem') or ''
-        if not raw_content:
-            for msg in obj['prompt']:
-                if msg['role'] == 'user':
-                    raw_content = msg['content']
-                    break
-        metadata['raw_content'] = raw_content
-        obj['metadata'] = metadata
-        fout.write(json.dumps(obj, ensure_ascii=False) + '\n')
-print(f'Created {dst} with {sum(1 for _ in dst.open())} entries')
-"
-
-# Preprocess eval data (only keep first 100 samples for fast eval)
-python3 -c "
-import json, pathlib
-src = pathlib.Path('/root/math/data/test_chat.jsonl')
-dst = pathlib.Path('/root/math/data/test_chat_eval.jsonl')
-MAX_EVAL_SAMPLES = 100
-count = 0
-with src.open() as fin, dst.open('w') as fout:
-    for line in fin:
-        if count >= MAX_EVAL_SAMPLES:
-            break
-        obj = json.loads(line)
-        metadata = obj.get('metadata') or {}
-        obj['label'] = metadata.get('final_answer') or metadata.get('solution') or obj.get('label', '')
-        fout.write(json.dumps(obj, ensure_ascii=False) + '\n')
-        count += 1
-print(f'Created {dst} with {count} samples (capped at {MAX_EVAL_SAMPLES})')
-"
+EVAL_ARGS=(--dataset "$EVAL_DATASET" --split test --output "$EVAL_OUT" --max-samples "$MAX_EVAL_SAMPLES" --answer-format "$EVAL_ANSWER_FORMAT")
+[ -n "$EVAL_CONFIG" ] && EVAL_ARGS+=(--config "$EVAL_CONFIG")
+$PREPROCESS "${EVAL_ARGS[@]}"
 
 
 ###############################################################################
@@ -197,22 +105,29 @@ print(f'Created {dst} with {count} samples (capped at {MAX_EVAL_SAMPLES})')
 CKPT_ARGS=(
    --hf-checkpoint /root/Qwen3-8B
    --ref-load "/root/Qwen3-8B_torch_dist"
-   --save /root/slime_siqi/output/Qwen3-8B_opsd_slime/
+   --save /root/slime_siqi/output/Qwen3-8B_opsd_full_slime/
    --save-interval 2000
+   # Paper Algorithm 1: teacher weights refreshed every M steps.
+   # --opsd-use-ref-as-teacher uses the "ref" backup as frozen teacher.
+   # --ref-update-interval 20:  sync backup every 20 rollout steps.
    --ref-update-interval 20
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/math/data/train_opsd.jsonl
+   --prompt-data /root/math/data/train_opsd_full.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
-   --apply-chat-template-kwargs '{"enable_thinking":false}'
+   # enable_thinking=true: student generates full reasoning traces.
+   # This is appropriate when distilling from full reference solutions.
+   --apply-chat-template-kwargs '{"enable_thinking":true}'
    --rollout-shuffle
    --num-rollout 300
    --rollout-batch-size 32
    --n-samples-per-prompt 1
-   --rollout-max-response-len 1024
+   # 4096 response tokens: teacher total ≈ teacher_prompt(~2000t) + 4096 ≈ 6100t
+   # Increasing to 8192 is possible but requires further reducing max-tokens-per-gpu.
+   --rollout-max-response-len 8192
    --rollout-temperature 1.2
    --over-sampling-batch-size 64
 
@@ -221,6 +136,8 @@ ROLLOUT_ARGS=(
 )
 
 RM_ARGS=(
+   # reward_func:          computes math accuracy (used for pg_loss and logging)
+   # post_process_rewards: builds teacher tokens using --opsd-teacher-info-mode=full
    --custom-rm-path examples.on_policy_distillation.on_policy_self_distillation.reward_func
    --custom-reward-post-process-path examples.on_policy_distillation.on_policy_self_distillation.post_process_rewards
    --reward-key math_reward
@@ -245,7 +162,10 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 4096
+   # Lowered from 4096 to 2048 to accommodate the extra teacher forward pass.
+   # Each batch now processes both student sequences AND teacher sequences
+   # (teacher_prompt ≈ 1500–2600 tokens longer than the student prompt).
+   --max-tokens-per-gpu 2048
 )
 
 GRPO_ARGS=(
@@ -253,16 +173,35 @@ GRPO_ARGS=(
    --use-opd
    --opd-type opsd
    --opd-kl-coef 0.0
-   --opsd-jsd-coef 1.0
-   --opsd-jsd-beta 0.5
-   --opsd-pure-mode
+
+   # Full OPSD mode: teacher receives problem + complete reference solution.
+   # Requires reference_solution in metadata (OpenThoughts-114k has this).
+   --opsd-teacher-info-mode full
+
+   # JSD loss: symmetric KL between student and teacher distributions.
+   # β=0.5 is the standard 50/50 weighting (original OPSD paper default).
+   --opsd-loss-type reverse_kl
+#    --opsd-jsd-beta 0.5
+   # α: teacher-KL weight. Reduced from 1.0 so pg_loss can contribute meaningfully.
+   # Combined loss: pg_loss + 0.1·JSD + 0.01·KL_ref
+   --opsd-jsd-coef 0.1
+
+   # No --opsd-pure-mode: pg_loss is active alongside both KL terms.
+   # Remove this comment and add --opsd-pure-mode to revert to distillation-only.
+
+   # Frozen teacher: use ref model backup instead of live student weights.
+   # Provides a stable distillation target (Algorithm 1 of arXiv 2601.18734).
    --opsd-use-ref-as-teacher
    --entropy-coef 0.00
+
+   # β: ref-KL weight. Penalises drift from the initial policy (ref model).
+   --use-kl-loss
+   --kl-loss-coef 0.01
 )
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-5
+   --lr 1e-6
    --lr-decay-style cosine
    --lr-warmup-fraction 0.1
    --weight-decay 0.1
@@ -273,7 +212,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-8B-opsd-jsd
+   --wandb-group qwen3-8B-opsd-full-pg+jsd+ref_kl
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 

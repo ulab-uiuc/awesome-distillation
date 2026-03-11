@@ -129,7 +129,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 32
    --n-samples-per-prompt 1
    --rollout-max-response-len 8192
-   --rollout-temperature 1.0
+   --rollout-temperature 1.2
    --over-sampling-batch-size 64
 
    --global-batch-size 32
@@ -180,11 +180,11 @@ GRPO_ARGS=(
 
    # Reverse KL: KL(student || teacher) -- mode-seeking, per OPSDC paper Eq.(1)
    --opsd-loss-type reverse_kl
-   --opsd-jsd-coef 1.0
+   --opsd-jsd-coef 0.1           # α: teacher KL 权重，与 pg_loss 并存时适当降低
 
-   # Pure distillation mode: zero out RL policy gradient, learn only from KL
-   # (OPSDC has no ground-truth rewards, compression is the sole training signal)
-   --opsd-pure-mode
+   # --opsd-pure-mode 已移除：pg_loss 正常参与训练
+   # 最终损失 = pg_loss + α·KL_teacher + β·KL_ref - ε·entropy
+   # 若需恢复纯蒸馏模式（无 pg_loss），可重新加回 --opsd-pure-mode
 
    # Paper Algorithm 1: θ̄ ← θ every M steps.
    # --opsd-use-ref-as-teacher: teacher uses the "ref" weight backup (not live weights).
@@ -213,7 +213,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-4B-opsdc-reverse_kl+_ref_kl
+   --wandb-group qwen3-4B-opsdc-reverse_kl+_ref_kl+reward_conciseness-prompt
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -238,8 +238,8 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=2,3,4,5
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 6 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 
 set +e
@@ -249,13 +249,13 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "2,3,4,5"
+        "CUDA_VISIBLE_DEVICES": "2,3,4,5,6,7"
      }
    }' \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 2 \
-   --rollout-num-gpus 2 \
+   --rollout-num-gpus 4 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
