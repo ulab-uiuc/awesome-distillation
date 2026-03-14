@@ -14,3 +14,13 @@ apt install iproute2 -y
 
 export RAY_memory_usage_threshold=0.99
 export RAY_memory_monitor_refresh_ms=0
+
+
+export TRAIN_DATASET="open-thoughts/OpenThoughts-114k"
+export TRAIN_CONFIG="metadata"
+TRAIN_ANSWER_FORMAT=answer EVAL_ANSWER_FORMAT=answer bash examples/on_policy_distillation/run-qwen3-4B-opsd_pi.sh
+
+TRAIN_ANSWER_FORMAT=boxed EVAL_ANSWER_FORMAT=boxed bash examples/on_policy_distillation/run-qwen3-4B-opsd_pi.sh
+
+
+bash examples/on_policy_distillation/run-qwen3-4B-opsd_pi.sh

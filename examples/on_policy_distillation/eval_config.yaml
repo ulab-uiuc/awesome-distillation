@@ -6,15 +6,36 @@
 # WITHOUT --no_thinking (default enable_thinking=True, max_new_tokens=38912).
 eval:
   defaults:
-    max_response_len: 38912
+    max_response_len: 16384
     top_p: 0.95
   datasets:
-    - name: math_test
-      path: /root/math/data/eval_opsdc.jsonl
+    # - name: aime24
+    #   path: /root/math/data/eval_aime24.jsonl
+    #   rm_type: math
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: true
+    # - name: aime25
+    #   path: /root/math/data/eval_aime25.jsonl
+    #   rm_type: math
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: true
+    # - name: hmmt
+    #   path: /root/math/data/eval_hmmt.jsonl
+    #   rm_type: math
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: true
+    # - name: amo_bench
+    #   path: /root/math/data/eval_amo_bench.jsonl
+    #   rm_type: math
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: true
+    - name: math500
+      path: /root/math/data/eval_math500.jsonl
       rm_type: math
-      n_samples_per_eval_prompt: 4
-      # Override global --apply-chat-template-kwargs for eval only.
-      # Set enable_thinking: false to use non-thinking mode (consistent with student rollout),
-      # or remove this key to use the global setting.
+      n_samples_per_eval_prompt: 1
       apply_chat_template_kwargs:
-        enable_thinking: true
+        enable_thinking: false

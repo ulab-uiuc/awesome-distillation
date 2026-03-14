@@ -475,46 +475,50 @@ def grade_answer_mathd(given_answer: str, ground_truth: str) -> bool:
     return False
 
 
-def extract_answer(passage: str) -> str:
+def extract_answer(passage: str, mode: str = "auto") -> str | None:
     """Extract the final answer from a model response.
 
-    Tries two formats in order:
-    1. ``Answer: <value>`` (case-insensitive) — highest priority.
-       \boxed{} is NOT used spontaneously; it only appears when the prompt
-       explicitly requests it.  Meanwhile, thinking-mode models routinely
-       place intermediate \boxed{} expressions inside <think> blocks, so
-       checking \boxed{} first would pick up wrong intermediate values.
-    2. LaTeX ``\\boxed{...}`` — fallback for prompts that explicitly ask for
-       boxed answers and produce no ``Answer:`` line.
+    Args:
+        passage: The model response string.
+        mode: Extraction mode controlling which format is tried.
+            - ``"answer"`` : Only look for ``Answer: <value>`` (DAPO / Minerva style).
+            - ``"boxed"``  : Only look for ``\\boxed{...}`` (LaTeX style).
+            - ``"auto"``   : Try ``Answer:`` first, then fall back to ``\\boxed{}``.
+              This is the legacy behaviour and can mis-fire on markdown headings
+              like ``### **Final Answer:**`` — prefer explicit modes when possible.
 
-    Returns the extracted string, or ``None`` if neither pattern is found.
+    Returns:
+        The extracted answer string, or ``None`` if not found.
     """
     import re
 
-    # 1. "Answer: ..." on its own line (DAPO / Minerva format) — check first.
-    match = re.findall(r"(?i)Answer\s*:\s*([^\n]+)", passage)
-    if match:
-        ans = match[-1].strip().rstrip(".")
-        # Strip special tokens like <|im_end|>, <|endoftext|>, etc.
-        ans = re.sub(r"<\|[^|]*\|>", "", ans).strip().rstrip(".")
-        # Strip outer LaTeX math delimiters: $8$ → 8, $\frac{1}{2}$ → \frac{1}{2}
-        ans = re.sub(r"^\$(.+)\$$", r"\1", ans).strip()
-        return ans
+    if mode in ("answer", "auto"):
+        # "Answer: ..." on its own line (DAPO / Minerva format).
+        match = re.findall(r"(?i)Answer\s*:\s*([^\n]+)", passage)
+        if match:
+            ans = match[-1].strip().rstrip(".")
+            # Strip special tokens like <|im_end|>, <|endoftext|>, etc.
+            ans = re.sub(r"<\|[^|]*\|>", "", ans).strip().rstrip(".")
+            # Strip outer LaTeX math delimiters: $8$ → 8, $\frac{1}{2}$ → \frac{1}{2}
+            ans = re.sub(r"^\$(.+)\$$", r"\1", ans).strip()
+            if ans:
+                return ans
 
-    # 2. \boxed{} fallback — only reached when the prompt explicitly asks for it.
-    if "\\boxed" in passage:
-        return extract_boxed_answer(passage)
+    if mode in ("boxed", "auto"):
+        # LaTeX \boxed{} — explicit boxed format or auto fallback.
+        if "\\boxed" in passage:
+            return extract_boxed_answer(passage)
 
     return None
 
 
-def grade_answer_verl(solution_str, ground_truth):
+def grade_answer_verl(solution_str, ground_truth, mode: str = "auto"):
     if not ground_truth:
         return False
     ground_truth = str(ground_truth)
     if "\\boxed" in ground_truth:
         ground_truth = extract_answer(ground_truth)
-    given_answer = extract_answer(solution_str)
+    given_answer = extract_answer(solution_str, mode=mode)
     if given_answer is None:
         return False
     return grade_answer_mathd(given_answer, ground_truth) or grade_answer_sympy(given_answer, ground_truth)

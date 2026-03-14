@@ -1015,7 +1015,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opsd-loss-type",
                 type=str,
-                choices=["jsd", "reverse_kl", "forward_kl"],
+                choices=["jsd", "reverse_kl", "forward_kl", "wiener_kl"],
                 default="jsd",
                 help=(
                     "Type of token-level distribution matching loss for OPSD. Default is 'jsd'. "
@@ -1025,6 +1025,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "  Gradient pushes student to avoid tokens the teacher ignores. "
                     "'forward_kl': KL(p_T || p_S) -- mode-covering; student is penalised for missing teacher mass. "
                     "  Equivalent to minimising NLL of teacher distribution under student. "
+                    "'wiener_kl': Parameter-free Wiener-style Trusted Self-Distillation. "
+                    "  Per-token gate w_t = [m_t]_+ / ([m_t]_+ + H_t^T + eps) where "
+                    "  m_t = log pi_T(y_t) - log pi_S(y_t) is the teacher-student margin at the "
+                    "  sampled token and H_t^T is the teacher entropy. "
+                    "  Loss = w_t * KL(pi_S || pi_T) + (1 - w_t) * KL(pi_T || pi_S). "
+                    "  Gate is large when teacher strongly supports y_t with low uncertainty. "
                     "Note: --opsd-jsd-beta is only used when --opsd-loss-type=jsd."
                 ),
             )

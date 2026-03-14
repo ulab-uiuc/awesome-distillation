@@ -341,6 +341,7 @@ def _compute_opsd_jsd_in_forward(
         compute_vocab_parallel_forward_kl,
         compute_vocab_parallel_jsd,
         compute_vocab_parallel_reverse_kl,
+        compute_vocab_parallel_wiener_kl,
     )
 
     loss_type = getattr(args, "opsd_loss_type", "jsd")
@@ -419,6 +420,7 @@ def _compute_opsd_jsd_in_forward(
 
     # ---- Compute per-sample JSD on response tokens ----
     opsd_jsd_values = []
+    opsd_wiener_weights = []  # only populated when loss_type == "wiener_kl"
     student_end = 0
     teacher_end = 0
     for i in range(len(response_lengths)):
@@ -437,8 +439,19 @@ def _compute_opsd_jsd_in_forward(
         teacher_start_pos = teacher_end - resp_len
         t_logits = teacher_logits_2d[teacher_start_pos - 1 : teacher_end - 1]  # [resp_len, V_local]
 
+        # Response tokens for wiener_kl gate: last resp_len tokens of the teacher sequence
+        # (teacher_tokens = privileged_prompt + student_response, so [t_prompt_len:] = response)
+        response_tokens_i = teacher_tokens_list[i][t_prompt_len : t_prompt_len + resp_len]  # [resp_len]
+
+        # Per-sample wiener gate accumulator (wiener_kl only).
+        wiener_w_chunks = []
+
         # Compute distribution-matching loss on smaller chunks to cap peak memory.
-        def _compute_loss_chunk(s_chunk: torch.Tensor, t_chunk: torch.Tensor) -> torch.Tensor:
+        def _compute_loss_chunk(
+            s_chunk: torch.Tensor,
+            t_chunk: torch.Tensor,
+            tok_chunk: torch.Tensor | None = None,
+        ) -> torch.Tensor:
             """Dispatch to the configured per-chunk loss function."""
             if s_chunk.dtype != torch.float32:
                 s_chunk = s_chunk.float()
@@ -451,6 +464,11 @@ def _compute_opsd_jsd_in_forward(
                 return compute_vocab_parallel_reverse_kl(s_chunk, t_chunk, tp_group)
             elif loss_type == "forward_kl":
                 return compute_vocab_parallel_forward_kl(s_chunk, t_chunk, tp_group)
+            elif loss_type == "wiener_kl":
+                assert tok_chunk is not None, "wiener_kl requires response_tokens"
+                chunk_loss, w = compute_vocab_parallel_wiener_kl(s_chunk, t_chunk, tok_chunk, tp_group)
+                wiener_w_chunks.append(w.detach())
+                return chunk_loss
             else:  # default: jsd
                 return compute_vocab_parallel_jsd(s_chunk, t_chunk, tp_group, beta=args.opsd_jsd_beta)
 
@@ -458,13 +476,24 @@ def _compute_opsd_jsd_in_forward(
             loss_chunks = []
             for chunk_start in range(0, resp_len, jsd_chunk_size):
                 chunk_end = min(chunk_start + jsd_chunk_size, resp_len)
-                loss_chunks.append(_compute_loss_chunk(s_logits[chunk_start:chunk_end], t_logits[chunk_start:chunk_end]))
+                tok_chunk = response_tokens_i[chunk_start:chunk_end] if loss_type == "wiener_kl" else None
+                loss_chunks.append(_compute_loss_chunk(
+                    s_logits[chunk_start:chunk_end],
+                    t_logits[chunk_start:chunk_end],
+                    tok_chunk,
+                ))
             jsd = torch.cat(loss_chunks, dim=0)
         else:
-            jsd = _compute_loss_chunk(s_logits, t_logits)
+            tok_arg = response_tokens_i if loss_type == "wiener_kl" else None
+            jsd = _compute_loss_chunk(s_logits, t_logits, tok_arg)
+
+        if wiener_w_chunks:
+            opsd_wiener_weights.append(torch.cat(wiener_w_chunks, dim=0))
         opsd_jsd_values.append(jsd)
 
     batch["opsd_jsd_values"] = opsd_jsd_values
+    if opsd_wiener_weights:
+        batch["opsd_wiener_weights"] = opsd_wiener_weights
 
 
 def _prefetch_opsd_teacher_logits(

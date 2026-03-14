@@ -72,13 +72,26 @@ def _get_tokenizer(model_path: str):
     return tokenizer
 
 
-def _grade_math(response: str, label: str) -> float:
+def _grade_math(response: str, label: str, answer_format: str = "auto") -> float:
     """Return 1.0 if the response correctly answers the math problem, else 0.0."""
     from slime.rollout.rm_hub import grade_answer_verl
 
     if not label:
         return 0.0
-    return 1.0 if grade_answer_verl(response, label) else 0.0
+    return 1.0 if grade_answer_verl(response, label, mode=answer_format) else 0.0
+
+
+def _extract_mode_from_metadata(metadata: dict) -> str:
+    """Infer answer extraction mode from the format_instruction stored in metadata.
+
+    Returns ``"boxed"``, ``"answer"``, or ``"auto"`` (fallback).
+    """
+    fmt = metadata.get("format_instruction", "") or ""
+    if "boxed" in fmt:
+        return "boxed"
+    if "Answer" in fmt:
+        return "answer"
+    return "auto"
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +170,9 @@ async def reward_func(args, sample, **kwargs):
     """
     response = sample.response
     label = sample.label or ""
-    math_reward = _grade_math(response, label)
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    answer_format = _extract_mode_from_metadata(metadata)
+    math_reward = _grade_math(response, label, answer_format)
     return {"math_reward": math_reward}
 
 
@@ -252,14 +267,17 @@ def post_process_rewards(args, samples, **kwargs):
             # Teacher only gets the final answer, not the full reasoning chain.
             # We still frame it as "here is the answer, now solve it yourself"
             # so the teacher stays in the response distribution.
+            # Use label (extracted final answer) preferentially over reference_solution
+            # (which may contain full reasoning steps for datasets like OpenThoughts-114k).
             _ANSWER_ONLY_PROMPT = (
                 "The correct final answer to this problem is: {answer}\n"
                 "Now solve the problem yourself step by step and arrive at the same answer:"
             )
-            if reference_solution:
+            answer_hint = label if label else reference_solution
+            if answer_hint:
                 teacher_user_content = (
                     f"{raw_content}\n\n"
-                    + _ANSWER_ONLY_PROMPT.format(answer=reference_solution)
+                    + _ANSWER_ONLY_PROMPT.format(answer=answer_hint)
                     + f"\n{format_instruction}"
                 )
             else:
@@ -274,7 +292,7 @@ def post_process_rewards(args, samples, **kwargs):
             _TRANSITION_PROMPT = (
                 "After understanding the reference solution and the rationale behind each step, "
                 "now articulate your own step-by-step reasoning that derives the same final answer "
-                "to the problem below:"
+                "to the problem above:"
             )
             if reference_solution and reasoning_mask_ratio > 0.0:
                 masked_solution = _mask_reference_solution(
@@ -327,7 +345,7 @@ def post_process_rewards(args, samples, **kwargs):
             _TRANSITION_PROMPT = (
                 "After understanding the reference solution and the rationale behind each step, "
                 "now articulate your own step-by-step reasoning that derives the same final answer "
-                "to the problem below:"
+                "to the problem above:"
             )
             if reference_solution:
                 teacher_user_content = (

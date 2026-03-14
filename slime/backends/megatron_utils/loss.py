@@ -871,6 +871,11 @@ def policy_loss_function(
         opsd_jsd = torch.cat(batch["opsd_jsd_values"], dim=0)
         reported_loss["opsd_jsd"] = sum_of_sample_mean(opsd_jsd).clone().detach()
 
+    # Add Wiener gate weight metrics if available (wiener_kl loss type only)
+    if "opsd_wiener_weights" in batch:
+        wiener_w = torch.cat(batch["opsd_wiener_weights"], dim=0)
+        reported_loss["opsd_wiener_weight"] = sum_of_sample_mean(wiener_w).clone().detach()
+
     return loss, reported_loss
 
 

@@ -91,16 +91,19 @@ TRAIN_ARGS=(--dataset "$TRAIN_DATASET" --split train --output "$TRAIN_OUT" --ans
 [ -n "$TRAIN_CONFIG" ] && TRAIN_ARGS+=(--config "$TRAIN_CONFIG")
 $PREPROCESS "${TRAIN_ARGS[@]}"
 
-# ---- Eval dataset -----------------------------------------------------------
-# Switch EVAL_DATASET to any dataset with problem+answer fields.
-EVAL_DATASET="${EVAL_DATASET:-math-ai/aime25}"
-EVAL_CONFIG="${EVAL_CONFIG:-}"
-EVAL_OUT="/root/math/data/eval_opsdc.jsonl"
-MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-100}"
-
-EVAL_ARGS=(--dataset "$EVAL_DATASET" --split test --output "$EVAL_OUT" --max-samples "$MAX_EVAL_SAMPLES" --answer-format "$EVAL_ANSWER_FORMAT")
-[ -n "$EVAL_CONFIG" ] && EVAL_ARGS+=(--config "$EVAL_CONFIG")
-$PREPROCESS "${EVAL_ARGS[@]}"
+# ---- Eval datasets ----------------------------------------------------------
+# Four competition benchmarks used as validation sets.
+# Dataset notes:
+#   aime24:    math-ai/aime24     – answer in `solution` as \boxed{N}; auto-extracted by generic format
+#   aime25:    math-ai/aime25     – answer in `answer` as plain integer
+#   hmmt:      FlagEval/HMMT_2025 – answer in `answer`, mixed (int/frac/expr); only `train` split exists
+#   amo_bench: meituan-longcat/AMO-Bench – answer in `answer`, highly variable; `answer_type` field present
+#              (descriptive/set answers will score 0 — acceptable for trend monitoring)
+$PREPROCESS --dataset math-ai/aime24             --split test  --output /root/math/data/eval_aime24.jsonl    --answer-format "$EVAL_ANSWER_FORMAT"
+$PREPROCESS --dataset math-ai/aime25             --split test  --output /root/math/data/eval_aime25.jsonl    --answer-format "$EVAL_ANSWER_FORMAT"
+$PREPROCESS --dataset FlagEval/HMMT_2025         --split train --output /root/math/data/eval_hmmt.jsonl      --answer-format "$EVAL_ANSWER_FORMAT"
+$PREPROCESS --dataset meituan-longcat/AMO-Bench  --split test  --output /root/math/data/eval_amo_bench.jsonl --answer-format "$EVAL_ANSWER_FORMAT"
+$PREPROCESS --dataset HuggingFaceH4/MATH-500     --split test  --output /root/math/data/eval_math500.jsonl   --answer-format "$EVAL_ANSWER_FORMAT"
 
 
 ###############################################################################
@@ -108,7 +111,7 @@ $PREPROCESS "${EVAL_ARGS[@]}"
 ###############################################################################
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Qwen3-4B
+   --hf-checkpoint Qwen/Qwen3-4B
    --ref-load "/root/Qwen3-4B_torch_dist"
    --save /root/slime_siqi/output/Qwen3-4B_opsdc_slime/
    --save-interval 2000
@@ -123,13 +126,13 @@ ROLLOUT_ARGS=(
    --input-key prompt
    --label-key label
    --apply-chat-template
-   --apply-chat-template-kwargs '{"enable_thinking":true}'
+   --apply-chat-template-kwargs '{"enable_thinking":false}'
    --rollout-shuffle
    --num-rollout 300
    --rollout-batch-size 32
    --n-samples-per-prompt 1
    --rollout-max-response-len 8192
-   --rollout-temperature 1.2
+   --rollout-temperature 1.0
    --over-sampling-batch-size 64
 
    --global-batch-size 32
@@ -179,9 +182,13 @@ GRPO_ARGS=(
    --opsd-teacher-info-mode full
 
    # Reverse KL: KL(student || teacher) -- mode-seeking, per OPSDC paper Eq.(1)
-   --opsd-loss-type reverse_kl
-   --opsd-jsd-coef 0.1           # α: teacher KL 权重，与 pg_loss 并存时适当降低
+   --opsd-loss-type wiener_kl
+   --opsd-jsd-coef 1.0           # α: teacher KL 权重，与 pg_loss 并存时适当降低
 
+   # pg_loss 正常参与训练
+   # 最终损失 = pg_loss + α·KL_teacher + β·KL_ref - ε·entropy
+
+   --opsd-pure-mode
    # --opsd-pure-mode 已移除：pg_loss 正常参与训练
    # 最终损失 = pg_loss + α·KL_teacher + β·KL_ref - ε·entropy
    # 若需恢复纯蒸馏模式（无 pg_loss），可重新加回 --opsd-pure-mode
@@ -213,7 +220,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-4B-opsdc-reverse_kl+_ref_kl
+   --wandb-group qwen3-4B-opsdc-wiener_kl+_ref_kl_PI_openthought
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -238,7 +245,7 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=2,3,4,5
+export CUDA_VISIBLE_DEVICES=1,2,3,4
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 
@@ -249,7 +256,7 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "2,3,4,5"
+        "CUDA_VISIBLE_DEVICES": "1,2,3,4"
      }
    }' \
    -- python3 train.py \
