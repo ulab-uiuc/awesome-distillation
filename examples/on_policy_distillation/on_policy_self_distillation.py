@@ -311,6 +311,19 @@ def post_process_rewards(args, samples, **kwargs):
             else:
                 teacher_user_content = f"{raw_content}\n\n{format_instruction}"
 
+        elif teacher_info_mode == "pi":
+            # Generic Prompt Internalization mode.
+            # Teacher receives the alignment instruction stored per-sample in
+            # metadata['pi_instruction'] prepended to the bare student prompt.
+            # Student always sees only the bare prompt (no alignment instruction).
+            pi_instruction = metadata.get("pi_instruction", "")
+            student_user_content = metadata.get("student_user_content") or raw_content
+            teacher_user_content = (
+                f"{pi_instruction}\n\n{student_user_content}"
+                if pi_instruction
+                else student_user_content
+            )
+
         elif teacher_info_mode == "conciseness":
             # OPSDC mode (arXiv 2603.05433): teacher gets a conciseness instruction
             # prepended to the original problem; NO ground-truth solution is needed.

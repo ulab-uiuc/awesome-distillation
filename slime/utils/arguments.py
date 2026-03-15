@@ -1060,7 +1060,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opsd-teacher-info-mode",
                 type=str,
-                choices=["full", "answer_only", "masked_reasoning", "conciseness"],
+                choices=["full", "answer_only", "masked_reasoning", "conciseness", "pi"],
                 default="full",
                 help=(
                     "Controls how much information the teacher receives in its privileged prompt, "

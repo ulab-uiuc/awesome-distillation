@@ -182,6 +182,8 @@ GRPO_ARGS=(
    --opsd-loss-type reverse_kl
    --opsd-jsd-coef 0.1           # α: teacher KL 权重，与 pg_loss 并存时适当降低
 
+   --opsd-pure-mode
+
    # --opsd-pure-mode 已移除：pg_loss 正常参与训练
    # 最终损失 = pg_loss + α·KL_teacher + β·KL_ref - ε·entropy
    # 若需恢复纯蒸馏模式（无 pg_loss），可重新加回 --opsd-pure-mode
