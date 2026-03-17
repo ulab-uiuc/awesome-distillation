@@ -35,18 +35,15 @@ source "/root/slime_siqi/scripts/models/qwen3-1.7B.sh"
 PREPROCESS="python3 examples/on_policy_distillation/preprocess_dataset.py"
 
 # ---- Training dataset -------------------------------------------------------
-TRAIN_DATASET="${TRAIN_DATASET:-open-thoughts/OpenThoughts-114k}"
-TRAIN_CONFIG="${TRAIN_CONFIG:-metadata}"
-TRAIN_OUT="/root/math/data/train_openthoughts.jsonl"
-
-# OpenThoughts uses boxed format (answers stored as \boxed{} in ground_truth_solution).
-# TRAIN_ANSWER_FORMAT controls the format instruction appended to each problem.
+# Use the math-only filter script: keeps domain==math samples with extractable
+# \boxed{} answers (~88,981 of 113,957 total rows; removes code/bio/physics/etc.)
+TRAIN_OUT="/root/math/data/train_openthoughts_math.jsonl"
 TRAIN_ANSWER_FORMAT="${TRAIN_ANSWER_FORMAT:-boxed}"
 EVAL_ANSWER_FORMAT="${EVAL_ANSWER_FORMAT:-boxed}"
 
-TRAIN_ARGS=(--dataset "$TRAIN_DATASET" --split train --output "$TRAIN_OUT" --answer-format "$TRAIN_ANSWER_FORMAT")
-[ -n "$TRAIN_CONFIG" ] && TRAIN_ARGS+=(--config "$TRAIN_CONFIG")
-$PREPROCESS "${TRAIN_ARGS[@]}"
+python3 examples/on_policy_distillation/filter_openthoughts_math.py \
+    --output "$TRAIN_OUT" \
+    --answer-format "$TRAIN_ANSWER_FORMAT"
 
 # ---- Eval datasets ----------------------------------------------------------
 $PREPROCESS --dataset math-ai/aime24             --split test  --output /root/math/data/eval_aime24.jsonl    --answer-format "$EVAL_ANSWER_FORMAT"
@@ -68,7 +65,7 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data "$TRAIN_OUT"
+   --prompt-data "$TRAIN_OUT"  # filtered math-only openthoughts
    --input-key prompt
    --label-key label
    --apply-chat-template
@@ -130,7 +127,11 @@ GRPO_ARGS=(
    --entropy-coef 0.00
 
    --use-kl-loss
-   --kl-loss-coef 0.01
+   --kl-loss-coef 0.0
+
+   --use-tis
+   --tis-clip 2.0
+   --tis-clip-low 0.0
 )
 
 OPTIMIZER_ARGS=(
@@ -146,7 +147,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-opsd_pi-forward_kl+ref_kl-answeronly-openthoughts
+   --wandb-group qwen3-1.7B-opsd_pi-forward_kl+ref_kl-answeronly-openthoughts-kl0
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -170,8 +171,8 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=1,2,3,4
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7,8,9
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 
 set +e
@@ -181,13 +182,13 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "2,3,4,5"
+        "CUDA_VISIBLE_DEVICES": "2,3,4,5,6,7,8,9"
      }
    }' \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 2 \
-   --rollout-num-gpus 2 \
+   --actor-num-gpus-per-node 4 \
+   --rollout-num-gpus 4 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \

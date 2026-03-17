@@ -8,6 +8,19 @@ docker run --name siqi_slime_opsd --gpus all --ipc=host -p 30000:30000 --shm-siz
   -it slimerl/slime:latest /bin/bash
 
 
+/data/siqizhu4/opsd_slime
+
+docker run --name siqi_slime_opsd --gpus all --ipc=host -p 30000:30000 --shm-size=64g \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v /data/siqizhu4/opsd_slime:/root/slime_siqi \
+  -v /data/siqizhu4/ray_tmp:/tmp/ray_siqi \
+  -v /data/siqizhu4/checkpoints:/root/checkpoints_siqi \
+  -v /data/siqizhu4/hf_cache:/root/.cache/huggingface \
+  -w /root/slime_siqi \
+  -it slimerl/slime:latest /bin/bash
+
+
+
 docker run --name siqi_slime_opsd --gpus all \
   --network host \
   --ipc=host --shm-size=64g \

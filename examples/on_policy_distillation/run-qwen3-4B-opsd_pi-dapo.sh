@@ -136,6 +136,10 @@ GRPO_ARGS=(
 
    --use-kl-loss
    --kl-loss-coef 0.01
+
+   --use-tis
+   --tis-clip 2.0
+   --tis-clip-low 0.0
 )
 
 OPTIMIZER_ARGS=(
