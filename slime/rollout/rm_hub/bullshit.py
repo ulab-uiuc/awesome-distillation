@@ -207,6 +207,7 @@ async def _call_llm_judge(
 ) -> float:
     import aiohttp
 
+    response = _strip_thinking(response)
     if label == "bullshit":
         user_content = _JUDGE_TEMPLATE_BULLSHIT.format(
             question=question,

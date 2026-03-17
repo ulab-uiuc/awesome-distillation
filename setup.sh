@@ -1,4 +1,4 @@
-docker run --name siqi_slime_opsd --gpus all --ipc=host --shm-size=64g \
+docker run --name siqi_slime_opsd --gpus all --ipc=host -p 30000:30000 --shm-size=64g \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -v /mnt/disk1_from_server2/siqizhu4/opsd_slime:/root/slime_siqi \
   -v /mnt/disk1_from_server2/siqizhu4/ray_tmp:/tmp/ray_siqi \
@@ -47,12 +47,21 @@ TRAIN_ANSWER_FORMAT=boxed EVAL_ANSWER_FORMAT=boxed bash examples/on_policy_disti
 bash examples/on_policy_distillation/run-qwen3-4B-opsd_pi.sh
 
 
-CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES=6,7 python -m sglang.launch_server \
     --model-path /root/checkpoints_siqi/models--Qwen--Qwen3-30B-A3B-Instruct-2507 \
     --host 0.0.0.0 \
     --port 30000 \
-    --context-length 32768 \
+    --context-length 16384 \
     --tp-size 2
+
+
+CUDA_VISIBLE_DEVICES=7,8 python -m sglang.launch_server \
+    --model-path checkpoints/models--Qwen--Qwen3-30B-A3B-Instruct-2507 \
+    --host 0.0.0.0 \
+    --port 30000 \
+    --context-length 65536 \
+    --tp-size 2
+
 
 export NCCL_P2P_DISABLE=1
 CUDA_VISIBLE_DEVICES=2,3,4,5 python -m sglang.launch_server \
@@ -81,3 +90,6 @@ sed -n '1360,1370p' /sgl-workspace/sglang/python/sglang/srt/managers/tokenizer_m
 
 # 删除data文件夹的git记录
 git rm -r --cached data
+
+export NCCL_P2P_DISABLE=1
+export NCCL_IB_DISABLE=1

@@ -113,6 +113,7 @@ async def _call_llm_judge(
     """Call an OpenAI-compatible chat completion endpoint. Returns 1.0 (PASS) or 0.0 (FAIL)."""
     import aiohttp  # already a project dependency
 
+    response = _strip_thinking(response)
     messages = [
         {"role": "system", "content": _JUDGE_SYSTEM},
         {
