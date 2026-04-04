@@ -1,4 +1,4 @@
-docker run --name siqi_slime_opsd --gpus all --ipc=host -p 30000:30000 --shm-size=64g \
+docker run --name siqi_slime_opsd --gpus all --ipc=host --shm-size=64g \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -v /mnt/disk1_from_server2/siqizhu4/opsd_slime:/root/slime_siqi \
   -v /mnt/disk1_from_server2/siqizhu4/ray_tmp:/tmp/ray_siqi \
@@ -112,7 +112,7 @@ export NCCL_IB_DISABLE=1
 CUDA_VISIBLE_DEVICES=3,6,7,8 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-1.7B --port 30000 --host 0.0.0.0 --tp 1
 
 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-8B --port 30001 --host 0.0.0.0 --tp 1
-CUDA_VISIBLE_DEVICES=8 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-1.7B --port 30002 --host 0.0.0.0 --tp 1
+CUDA_VISIBLE_DEVICES=9 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-1.7B --port 30002 --host 0.0.0.0 --tp 1
 
 
 kill -9 $(lsof -t -i :13141)

@@ -46,7 +46,6 @@ set -e
 # mkdir -p /root/slime/output/Qwen3-4B-Instruct-2507_opsd_slime/
 # echo "=== All done! ==="
 
-
 # 1. 下载 Qwen3-8B 模型
 echo "=== Downloading Qwen3-8B model ==="
 hf download Qwen/Qwen3-1.7B --local-dir /root/Qwen3-1.7B

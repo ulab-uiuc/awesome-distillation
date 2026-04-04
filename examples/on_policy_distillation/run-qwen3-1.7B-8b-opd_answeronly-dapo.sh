@@ -69,14 +69,15 @@ export PYTHONBUFFERED=16
 # Step -1: Start external SGLang teacher server (Qwen3-8B)
 ###############################################################################
 
-TEACHER_IP="127.0.0.1"
-TEACHER_PORT="${TEACHER_PORT:-13141}"
+TEACHER_IP="172.22.224.251"
+TEACHER_PORT="${TEACHER_PORT:-30000}"
 TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-Qwen/Qwen3-8B}"
-TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-6}"
-TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.72}"
+TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-9}"
+TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.90}"
 TEACHER_LOG_FILE="/tmp/sglang_teacher_qwen3_8b_$(date +%s).log"
 TEACHER_STARTED_BY_SCRIPT=0
 
+# curl "http://172.22.224.251:13141/health_generate"
 echo "Starting teacher model server (model=${TEACHER_MODEL_PATH})..."
 if curl -sf --max-time 2 "http://${TEACHER_IP}:${TEACHER_PORT}/health_generate" >/dev/null; then
     echo "Teacher server already running at ${TEACHER_IP}:${TEACHER_PORT}, reusing."
@@ -242,7 +243,7 @@ GRPO_ARGS=(
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-6
+   --lr 2e-6
    --lr-decay-style cosine
    --lr-warmup-fraction 0.1
    --weight-decay 0.1
@@ -259,7 +260,7 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.68}"
+   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.9}"
 )
 
 MISC_ARGS=(
@@ -277,7 +278,7 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=3,4,5
+export CUDA_VISIBLE_DEVICES=3,5,7
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 3 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 set +e
@@ -287,7 +288,7 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "3,4,5"
+        "CUDA_VISIBLE_DEVICES": "3,5,7"
      }
    }' \
    -- python3 train.py \
