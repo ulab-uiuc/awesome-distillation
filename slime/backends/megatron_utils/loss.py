@@ -832,6 +832,115 @@ def policy_loss_function(
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
 
+    # ---- OPSD advantage masking & weighting (optional) ----
+    # Both features share the same smoothed & z-score normalized signal pipeline.
+    # Masking: zero out pg_loss for tokens inconsistent with advantage direction.
+    # Weighting: multiply pg_loss by a configurable function of normalized_signal
+    # (exp or 2*sigmoid), then clamp to [1-eps, 1+eps].
+    opsd_adv_mask_ratio = None
+    opsd_adv_weight_mean = None
+    _do_masking = getattr(args, "opsd_advantage_masking", False) and "opsd_token_signal" in batch
+    _do_weighting = getattr(args, "opsd_advantage_weighting", False) and "opsd_token_signal" in batch
+    opsd_normalized_signal_list = []  # collected for wandb logging (pos/neg fraction)
+    if _do_masking or _do_weighting:
+        opsd_token_signal_list = batch["opsd_token_signal"]
+        advantages_list = batch["advantages"]
+        window_size = getattr(args, "opsd_signal_window_size", 32)
+        weighting_eps = getattr(args, "opsd_advantage_weighting_epsilon", 0.2)
+        weighting_fn = str(getattr(args, "opsd_advantage_weighting_fn", "sigmoid")).lower()
+        weighting_sign_mode = str(
+            getattr(args, "opsd_advantage_weighting_sign_mode", "flip_on_negative_advantage")
+        ).lower()
+
+        mask_list = []
+        weight_list = []
+        for signal_i, advantage_i in zip(opsd_token_signal_list, advantages_list):
+            signal_i = signal_i.to(device=advantage_i.device, dtype=torch.float32)
+            resp_len = signal_i.numel()
+
+            # 1. Centered moving average smoothing (truncated boundary).
+            # Even windows are right-biased:
+            # left_span=(w-1)//2, right_span=w//2.
+            w = max(1, int(window_size))
+            if w > 1 and resp_len > 1:
+                left_span = (w - 1) // 2
+                right_span = w // 2
+                idx = torch.arange(resp_len, device=signal_i.device)
+                starts = torch.clamp(idx - left_span, min=0)
+                ends = torch.clamp(idx + right_span + 1, max=resp_len)  # exclusive
+                prefix = torch.cat(
+                    [
+                        torch.zeros(1, device=signal_i.device, dtype=signal_i.dtype),
+                        torch.cumsum(signal_i, dim=0),
+                    ],
+                    dim=0,
+                )
+                sums = prefix[ends] - prefix[starts]
+                counts = (ends - starts).to(dtype=signal_i.dtype).clamp(min=1.0)
+                smoothed = sums / counts
+            else:
+                smoothed = signal_i
+
+            # 2. Z-score normalization
+            mean = smoothed.mean()
+            std = smoothed.std().clamp(min=1e-8)
+            normalized = (smoothed - mean) / std
+
+            # Collect normalized signal for logging
+            opsd_normalized_signal_list.append(normalized.detach())
+
+            adv_mean = advantage_i.mean()
+
+            # 3. Masking: keep tokens consistent with advantage direction
+            if _do_masking:
+                if adv_mean > 0:
+                    token_mask = (normalized >= 0).float()
+                elif adv_mean < 0:
+                    token_mask = (normalized <= 0).float()
+                else:
+                    token_mask = torch.ones_like(normalized)
+                # Edge case: if all tokens masked, keep all
+                if token_mask.sum() == 0:
+                    token_mask = torch.ones_like(token_mask)
+                mask_list.append(token_mask)
+
+            # 4. Weighting: configurable function over normalized signal, then clamp
+            if _do_weighting:
+                if weighting_sign_mode == "none":
+                    normalized_for_weight = normalized
+                elif weighting_sign_mode == "flip_on_negative_advantage":
+                    normalized_for_weight = -normalized if adv_mean < 0 else normalized
+                else:
+                    raise ValueError(
+                        "Unsupported --opsd-advantage-weighting-sign-mode: "
+                        f"{weighting_sign_mode!r}. Expected one of "
+                        "['none', 'flip_on_negative_advantage']."
+                    )
+
+                if weighting_fn == "exp":
+                    token_weight_raw = torch.exp(normalized_for_weight)
+                elif weighting_fn == "sigmoid":
+                    token_weight_raw = 2.0 * torch.sigmoid(normalized_for_weight)
+                else:
+                    raise ValueError(
+                        "Unsupported --opsd-advantage-weighting-fn: "
+                        f"{weighting_fn!r}. Expected one of ['sigmoid', 'exp']."
+                    )
+                token_weight = token_weight_raw.clamp(min=1.0 - weighting_eps, max=1.0 + weighting_eps)
+                weight_list.append(token_weight)
+
+        # Apply masking
+        if _do_masking:
+            opsd_adv_mask = torch.cat(mask_list, dim=0).detach()
+            opsd_adv_mask_ratio = 1.0 - opsd_adv_mask.mean()
+            pg_loss = pg_loss * opsd_adv_mask
+
+        # Apply weighting (stop gradient: weights only re-scale, no grad through weighting function)
+        if _do_weighting:
+            opsd_adv_weight = torch.cat(weight_list, dim=0).detach()
+            opsd_adv_weight_mean = opsd_adv_weight.mean().detach()
+            pg_loss = pg_loss * opsd_adv_weight
+
     # Apply off-policy correction using importance sampling if enabled
     # opsd_is_weights_flat: IS weights flattened to [total_tokens], used to re-weight OPSD JSD loss below.
     opsd_is_weights_flat = None
@@ -1166,6 +1275,37 @@ def policy_loss_function(
 
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
+
+    # OPSD advantage masking metrics
+    if opsd_adv_mask_ratio is not None:
+        reported_loss["opsd_adv_mask_ratio"] = (
+            opsd_adv_mask_ratio.clone().detach()
+            if isinstance(opsd_adv_mask_ratio, torch.Tensor)
+            else torch.tensor(opsd_adv_mask_ratio, device=logits.device)
+        )
+    # OPSD advantage weighting metrics
+    if opsd_adv_weight_mean is not None:
+        reported_loss["opsd_adv_weight_mean"] = (
+            opsd_adv_weight_mean.clone().detach()
+            if isinstance(opsd_adv_weight_mean, torch.Tensor)
+            else torch.tensor(opsd_adv_weight_mean, device=logits.device)
+        )
+    # OPSD normalized signal positive/negative fraction (from smoothed & z-scored signal)
+    if opsd_normalized_signal_list:
+        _norm_sig_cat = torch.cat(opsd_normalized_signal_list, dim=0)
+        _total = max(_norm_sig_cat.numel(), 1)
+        reported_loss["opsd_norm_signal_pos_frac"] = torch.tensor(
+            (_norm_sig_cat > 0).float().sum().item() / _total, device=logits.device
+        )
+        reported_loss["opsd_norm_signal_neg_frac"] = torch.tensor(
+            (_norm_sig_cat < 0).float().sum().item() / _total, device=logits.device
+        )
+    if "opsd_token_signal" in batch:
+        _signal_cat = torch.cat(batch["opsd_token_signal"], dim=0)
+        reported_loss["opsd_signal_mean"] = sum_of_sample_mean(_signal_cat).clone().detach()
+        reported_loss["opsd_signal_pos_frac"] = sum_of_sample_mean(
+            (_signal_cat > 0).float()
+        ).clone().detach()
 
     if opd_distill_sample_mask_tensor is not None:
         if opd_distill_sample_mask_tensor.numel() > 0:

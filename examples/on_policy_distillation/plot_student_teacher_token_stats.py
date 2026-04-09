@@ -28,8 +28,8 @@ python examples/on_policy_distillation/plot_student_teacher_token_stats.py \
   --weighted-smooth
 
 python examples/on_policy_distillation/plot_student_teacher_token_stats.py \
-  --input /data/siqizhu4/opsd_slime/eval_openthoughts_student_teacher_inference_all_nothinking_b256.jsonl \
-  --output-dir ./student_teacher_plots \
+  --input eval_openthoughts_student_teacher_inference_all_thinking_b256.jsonl \
+  --output-dir ./student_teacher_plots_heheda \
   --y-min -0.3 \
   --y-max 0.2 \
   --smooth-window 51 \
@@ -50,6 +50,19 @@ python examples/on_policy_distillation/plot_student_teacher_token_stats.py \
   --weighted-smooth \
   --entropy-bin-count 58 \
   --entropy-bin-strategy equal_width
+
+
+
+python examples/on_policy_distillation/plot_student_teacher_token_stats.py \
+  --input eval_openthoughts_student8b_teacher8b_inference_all_nothinking_entropy_b128.jsonl \
+  --output-dir ./student8b_teacher_plots_nothinking_entropy \
+  --y-min -0.2 \
+  --y-max 0.1 \
+  --smooth-window 51 \
+  --raw-alpha 0.05 \
+  --min-count-per-pos 16 \
+  --weighted-smooth
+
 
 pip install matplotlib
 python examples/on_policy_distillation/plot_student_teacher_token_stats.py \
@@ -200,6 +213,79 @@ def _smooth_series_weighted(y: np.ndarray, weights: np.ndarray, window: int) -> 
     den = np.convolve(weights, kernel, mode="same")
     den = np.maximum(den, 1e-12)
     return num / den
+
+
+def compute_opsd_advantage_weights_from_delta(
+    delta: np.ndarray,
+    window_size: int,
+    epsilon: float,
+    weighting_fn: str = "sigmoid",
+    flip_sign: bool = False,
+) -> np.ndarray:
+    """Mirror OPSD advantage-weighting in training:
+    delta -> centered moving average (truncated boundary, even window right-biased)
+    -> z-score -> optional sign flip -> configurable weighting fn -> clamp.
+    """
+    signal = np.asarray(delta, dtype=np.float64)
+    if signal.size == 0:
+        return np.array([], dtype=np.float64)
+
+    finite_mask = np.isfinite(signal)
+    if not np.any(finite_mask):
+        return np.full(signal.shape, np.nan, dtype=np.float64)
+
+    # Robustness for eval JSONL: fill non-finite values before smoothing so one NaN
+    # does not invalidate the whole response; restore them to NaN at the end.
+    if not np.all(finite_mask):
+        finite_idx = np.flatnonzero(finite_mask)
+        signal_filled = signal.copy()
+        signal_filled[~finite_mask] = np.interp(
+            np.flatnonzero(~finite_mask),
+            finite_idx,
+            signal[finite_mask],
+        )
+        signal = signal_filled
+
+    w = max(1, int(window_size))
+    if w > 1 and signal.size > 1:
+        # Centered moving average with truncated boundaries.
+        # Even windows are right-biased: left_span=(w-1)//2, right_span=w//2.
+        n = signal.size
+        left_span = (w - 1) // 2
+        right_span = w // 2
+        idx = np.arange(n, dtype=np.int64)
+        starts = np.maximum(idx - left_span, 0)
+        ends = np.minimum(idx + right_span + 1, n)  # exclusive
+        prefix = np.concatenate([np.array([0.0], dtype=np.float64), np.cumsum(signal, dtype=np.float64)])
+        sums = prefix[ends] - prefix[starts]
+        counts = np.maximum(ends - starts, 1)
+        smoothed = sums / counts
+    else:
+        smoothed = signal
+
+    mean = float(np.mean(smoothed))
+    std = float(np.std(smoothed))
+    if not np.isfinite(std):
+        std = 0.0
+    std = max(std, 1e-8)
+    normalized = (smoothed - mean) / std
+
+    eps = float(epsilon)
+    lo = 1.0 - eps
+    hi = 1.0 + eps
+    normalized_for_weight = -normalized if flip_sign else normalized
+    fn = str(weighting_fn).strip().lower()
+    if fn == "exp":
+        raw_weights = np.exp(normalized_for_weight)
+    elif fn == "sigmoid":
+        raw_weights = 2.0 / (1.0 + np.exp(-normalized_for_weight))
+    else:
+        raise ValueError(
+            f"Unsupported opsd advantage weighting fn: {weighting_fn!r}. Expected one of ['sigmoid', 'exp']."
+        )
+    weights = np.clip(raw_weights, lo, hi)
+    weights[~finite_mask] = np.nan
+    return weights
 
 
 def _short_model_name(model: str | None) -> str:
@@ -584,7 +670,8 @@ def plot_entropy_vs_teacher_minus_student(
     if not sources:
         print(
             "No entropy-vs-delta figure generated "
-            "(need token_stats.student_entropies + aligned student/teacher logprobs)."
+            "(need token_stats.student_entropies + aligned student/teacher logprobs; "
+            "re-run eval with student token entropy recording enabled)."
         )
         return
 
@@ -612,9 +699,12 @@ def plot_entropy_vs_teacher_minus_student(
     print(f"Generated {generated} entropy-vs-delta figure(s) in {output_dir}")
 
 
-def plot_teacher_group_smoothed_lines(
-    records: list[dict],
+def _plot_teacher_group_smoothed_lines_core(
+    group_pos_values: dict[int, dict[int, list[float]]],
+    group_labels: dict[int, str],
     output_dir: Path,
+    out_filename: str,
+    title_suffix: str,
     dpi: int,
     y_min: float | None,
     y_max: float | None,
@@ -623,38 +713,8 @@ def plot_teacher_group_smoothed_lines(
     min_count_per_pos: int,
     weighted_smooth: bool,
 ):
-    group_pos_values: dict[int, dict[int, list[float]]] = {}
-    group_labels: dict[int, str] = {}
-
-    for record in records:
-        token_stats = record.get("token_stats") or {}
-        student_lp = _as_float_array(token_stats.get("student_logprobs"))
-        teachers = token_stats.get("teachers") or []
-        if student_lp.size == 0 or not isinstance(teachers, list):
-            continue
-
-        for g_idx, tinfo in enumerate(teachers):
-            if not isinstance(tinfo, dict):
-                continue
-            if g_idx not in group_labels:
-                group_labels[g_idx] = _teacher_setting_label(
-                    tinfo.get("mode"),
-                    tinfo.get("model"),
-                    tinfo.get("api_base"),
-                )
-            teacher_lp = _as_float_array(tinfo.get("logprobs"))
-            if teacher_lp.size == 0:
-                continue
-            n = min(student_lp.size, teacher_lp.size)
-            if n <= 0:
-                continue
-            delta = teacher_lp[:n] - student_lp[:n]
-            for pos, v in enumerate(delta):
-                if np.isfinite(v):
-                    group_pos_values.setdefault(g_idx, {}).setdefault(pos, []).append(float(v))
-
+    """Core plotting logic shared by the full / reward-split teacher-group plots."""
     if not group_pos_values:
-        print("No teacher-group smoothed line figure generated (missing token_stats.teachers[*].logprobs).")
         return
 
     colors = plt.get_cmap("tab10").colors
@@ -718,7 +778,7 @@ def plot_teacher_group_smoothed_lines(
     ax.set_ylabel("teacher logprob - student logprob")
     ax.set_title(
         "teacher logprob - student logprob "
-        f"(openthoughts, student: qwen3-8b enable_thinking=false)"
+        f"(openthoughts, student: qwen3-8b enable_thinking=false{title_suffix})"
     )
     _apply_y_limits(ax, y_min=y_min, y_max=y_max)
     ax.grid(alpha=0.22)
@@ -732,7 +792,7 @@ def plot_teacher_group_smoothed_lines(
         title="Teacher Setting",
     )
     fig.tight_layout()
-    out_file = output_dir / "summary_teacher_groups_smoothed_line.png"
+    out_file = output_dir / out_filename
     try:
         fig.savefig(out_file, dpi=dpi)
     except PermissionError as e:
@@ -741,6 +801,332 @@ def plot_teacher_group_smoothed_lines(
         ) from e
     plt.close(fig)
     print(f"Generated teacher-group smoothed line figure in {out_file}")
+
+
+def _collect_teacher_group_data(
+    records: list[dict],
+) -> tuple[dict[int, dict[int, list[float]]], dict[int, str]]:
+    """Collect per-group, per-position delta values and group labels from records."""
+    group_pos_values: dict[int, dict[int, list[float]]] = {}
+    group_labels: dict[int, str] = {}
+
+    for record in records:
+        token_stats = record.get("token_stats") or {}
+        student_lp = _as_float_array(token_stats.get("student_logprobs"))
+        teachers = token_stats.get("teachers") or []
+        if student_lp.size == 0 or not isinstance(teachers, list):
+            continue
+
+        for g_idx, tinfo in enumerate(teachers):
+            if not isinstance(tinfo, dict):
+                continue
+            if g_idx not in group_labels:
+                group_labels[g_idx] = _teacher_setting_label(
+                    tinfo.get("mode"),
+                    tinfo.get("model"),
+                    tinfo.get("api_base"),
+                )
+            teacher_lp = _as_float_array(tinfo.get("logprobs"))
+            if teacher_lp.size == 0:
+                continue
+            n = min(student_lp.size, teacher_lp.size)
+            if n <= 0:
+                continue
+            delta = teacher_lp[:n] - student_lp[:n]
+            for pos, v in enumerate(delta):
+                if np.isfinite(v):
+                    group_pos_values.setdefault(g_idx, {}).setdefault(pos, []).append(float(v))
+
+    return group_pos_values, group_labels
+
+
+def plot_teacher_group_smoothed_lines(
+    records: list[dict],
+    output_dir: Path,
+    dpi: int,
+    y_min: float | None,
+    y_max: float | None,
+    smooth_window: int,
+    raw_alpha: float,
+    min_count_per_pos: int,
+    weighted_smooth: bool,
+):
+    # --- Original plot (all records) ---
+    group_pos_values, group_labels = _collect_teacher_group_data(records)
+
+    if not group_pos_values:
+        print("No teacher-group smoothed line figure generated (missing token_stats.teachers[*].logprobs).")
+        return
+
+    _plot_teacher_group_smoothed_lines_core(
+        group_pos_values=group_pos_values,
+        group_labels=group_labels,
+        output_dir=output_dir,
+        out_filename="summary_teacher_groups_smoothed_line.png",
+        title_suffix="",
+        dpi=dpi,
+        y_min=y_min,
+        y_max=y_max,
+        smooth_window=smooth_window,
+        raw_alpha=raw_alpha,
+        min_count_per_pos=min_count_per_pos,
+        weighted_smooth=weighted_smooth,
+    )
+
+    # --- Reward-split plots ---
+    for reward_val, reward_tag in [(1, "reward1"), (0, "reward0")]:
+        filtered = [r for r in records if r.get("student_reward") == reward_val]
+        if not filtered:
+            print(f"No records with student_reward={reward_val}, skipping {reward_tag} plot.")
+            continue
+        gpv, gl = _collect_teacher_group_data(filtered)
+        if not gpv:
+            print(f"No teacher-group data for student_reward={reward_val}, skipping {reward_tag} plot.")
+            continue
+        # Reuse group_labels from the full dataset so legend stays consistent even
+        # when a reward subset is missing some groups.
+        merged_labels = {**group_labels, **gl}
+        _plot_teacher_group_smoothed_lines_core(
+            group_pos_values=gpv,
+            group_labels=merged_labels,
+            output_dir=output_dir,
+            out_filename=f"summary_teacher_groups_smoothed_line_{reward_tag}.png",
+            title_suffix=f", reward={reward_val}",
+            dpi=dpi,
+            y_min=y_min,
+            y_max=y_max,
+            smooth_window=smooth_window,
+            raw_alpha=raw_alpha,
+            min_count_per_pos=min_count_per_pos,
+            weighted_smooth=weighted_smooth,
+        )
+
+
+def collect_teacher_group_weight_data(
+    records: list[dict],
+    opsd_signal_window_size: int,
+    opsd_advantage_weighting_epsilon: float,
+    opsd_advantage_weighting_fn: str,
+    opsd_advantage_weighting_sign_mode: str,
+) -> tuple[dict[int, dict[int, list[float]]], dict[int, str]]:
+    """Collect per-group, per-position OPSD advantage weights from teacher-student deltas."""
+    group_pos_weights: dict[int, dict[int, list[float]]] = {}
+    group_labels: dict[int, str] = {}
+
+    for record in records:
+        if opsd_advantage_weighting_sign_mode == "none":
+            flip_sign = False
+        elif opsd_advantage_weighting_sign_mode == "flip_on_reward0":
+            flip_sign = record.get("student_reward") == 0
+        else:
+            raise ValueError(
+                "Unsupported opsd advantage weighting sign mode: "
+                f"{opsd_advantage_weighting_sign_mode!r}. "
+                "Expected one of ['none', 'flip_on_reward0']."
+            )
+
+        token_stats = record.get("token_stats") or {}
+        student_lp = _as_float_array(token_stats.get("student_logprobs"))
+        teachers = token_stats.get("teachers") or []
+        if student_lp.size == 0 or not isinstance(teachers, list):
+            continue
+
+        for g_idx, tinfo in enumerate(teachers):
+            if not isinstance(tinfo, dict):
+                continue
+            if g_idx not in group_labels:
+                group_labels[g_idx] = _teacher_setting_label(
+                    tinfo.get("mode"),
+                    tinfo.get("model"),
+                    tinfo.get("api_base"),
+                )
+
+            teacher_lp = _as_float_array(tinfo.get("logprobs"))
+            if teacher_lp.size == 0:
+                continue
+
+            n = min(student_lp.size, teacher_lp.size)
+            if n <= 0:
+                continue
+
+            delta = teacher_lp[:n] - student_lp[:n]
+            weights = compute_opsd_advantage_weights_from_delta(
+                delta=delta,
+                window_size=opsd_signal_window_size,
+                epsilon=opsd_advantage_weighting_epsilon,
+                weighting_fn=opsd_advantage_weighting_fn,
+                flip_sign=flip_sign,
+            )
+            for pos, w in enumerate(weights):
+                if np.isfinite(w):
+                    group_pos_weights.setdefault(g_idx, {}).setdefault(pos, []).append(float(w))
+
+    return group_pos_weights, group_labels
+
+
+def _plot_teacher_group_adv_weight_lines_core(
+    group_pos_weights: dict[int, dict[int, list[float]]],
+    group_labels: dict[int, str],
+    output_dir: Path,
+    out_filename: str,
+    title_suffix: str,
+    dpi: int,
+    min_count_per_pos: int,
+    opsd_signal_window_size: int,
+    opsd_advantage_weighting_epsilon: float,
+    opsd_advantage_weighting_fn: str,
+    opsd_advantage_weighting_sign_mode: str,
+):
+    if not group_pos_weights:
+        return
+
+    colors = plt.get_cmap("tab10").colors
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    sortable = []
+    for g_idx, pos_map in group_pos_weights.items():
+        vals = [v for pos in pos_map.values() for v in pos]
+        gm = float(np.mean(vals)) if vals else 1.0
+        sortable.append((gm, g_idx))
+    sortable.sort(key=lambda x: x[0])
+
+    plotted = 0
+    for _, g_idx in sortable:
+        pos_map = group_pos_weights[g_idx]
+        positions = sorted(pos_map.keys())
+        x_all = np.asarray([p + 1 for p in positions], dtype=np.int64)
+        mean_w_all = np.asarray([float(np.mean(pos_map[p])) for p in positions], dtype=np.float64)
+        counts_all = np.asarray([len(pos_map[p]) for p in positions], dtype=np.float64)
+
+        if min_count_per_pos > 1:
+            keep = counts_all >= float(min_count_per_pos)
+        else:
+            keep = np.ones_like(counts_all, dtype=bool)
+        x = x_all[keep]
+        mean_w = mean_w_all[keep]
+        if x.size == 0:
+            continue
+
+        color = colors[g_idx % len(colors)]
+        ax.plot(
+            x,
+            mean_w,
+            color=color,
+            lw=1.8,
+            alpha=0.95,
+            solid_capstyle="round",
+            label=group_labels.get(g_idx, f"group {g_idx + 1}"),
+        )
+        plotted += 1
+
+    if plotted == 0:
+        plt.close(fig)
+        print(
+            "No OPSD advantage-weight figure generated "
+            f"(all groups filtered by min_count_per_pos={min_count_per_pos})."
+        )
+        return
+
+    ax.axhline(1.0, color="#444444", ls="--", lw=1.0, alpha=0.7)
+    ax.set_xlabel("token position")
+    ax.set_ylabel("opsd advantage weight")
+    ax.set_title(
+        "OPSD advantage weight by token position "
+        f"(fn={opsd_advantage_weighting_fn}, sign_mode={opsd_advantage_weighting_sign_mode}, "
+        f"window={opsd_signal_window_size}, "
+        f"epsilon={opsd_advantage_weighting_epsilon}{title_suffix})"
+    )
+    ax.grid(alpha=0.22)
+    ax.legend(
+        loc="upper right",
+        ncol=1,
+        frameon=True,
+        framealpha=0.90,
+        title="Teacher Setting",
+    )
+    fig.tight_layout()
+
+    out_file = output_dir / out_filename
+    try:
+        fig.savefig(out_file, dpi=dpi)
+    except PermissionError as e:
+        raise PermissionError(
+            f"Cannot write to {out_file}. Check --output-dir permissions or use a new directory."
+        ) from e
+    plt.close(fig)
+    print(f"Generated OPSD advantage-weight line figure in {out_file}")
+
+
+def plot_teacher_group_adv_weight_lines(
+    records: list[dict],
+    output_dir: Path,
+    dpi: int,
+    min_count_per_pos: int,
+    opsd_signal_window_size: int,
+    opsd_advantage_weighting_epsilon: float,
+    opsd_advantage_weighting_fn: str,
+    opsd_advantage_weighting_sign_mode: str,
+):
+    # --- Original plot (all records) ---
+    group_pos_weights, group_labels = collect_teacher_group_weight_data(
+        records=records,
+        opsd_signal_window_size=opsd_signal_window_size,
+        opsd_advantage_weighting_epsilon=opsd_advantage_weighting_epsilon,
+        opsd_advantage_weighting_fn=opsd_advantage_weighting_fn,
+        opsd_advantage_weighting_sign_mode=opsd_advantage_weighting_sign_mode,
+    )
+    if not group_pos_weights:
+        print(
+            "No OPSD advantage-weight figure generated "
+            "(missing token_stats.teachers[*].logprobs or student_logprobs)."
+        )
+        return
+
+    _plot_teacher_group_adv_weight_lines_core(
+        group_pos_weights=group_pos_weights,
+        group_labels=group_labels,
+        output_dir=output_dir,
+        out_filename="summary_opsd_advantage_weight_by_token_teacher_groups.png",
+        title_suffix="",
+        dpi=dpi,
+        min_count_per_pos=min_count_per_pos,
+        opsd_signal_window_size=opsd_signal_window_size,
+        opsd_advantage_weighting_epsilon=opsd_advantage_weighting_epsilon,
+        opsd_advantage_weighting_fn=opsd_advantage_weighting_fn,
+        opsd_advantage_weighting_sign_mode=opsd_advantage_weighting_sign_mode,
+    )
+
+    # --- Reward-split plots ---
+    for reward_val, reward_tag in [(1, "reward1"), (0, "reward0")]:
+        filtered = [r for r in records if r.get("student_reward") == reward_val]
+        if not filtered:
+            print(f"No records with student_reward={reward_val}, skipping {reward_tag} weight plot.")
+            continue
+        gpw, gl = collect_teacher_group_weight_data(
+            records=filtered,
+            opsd_signal_window_size=opsd_signal_window_size,
+            opsd_advantage_weighting_epsilon=opsd_advantage_weighting_epsilon,
+            opsd_advantage_weighting_fn=opsd_advantage_weighting_fn,
+            opsd_advantage_weighting_sign_mode=opsd_advantage_weighting_sign_mode,
+        )
+        if not gpw:
+            print(f"No OPSD advantage-weight data for student_reward={reward_val}, skipping {reward_tag} plot.")
+            continue
+        # Reuse labels from the full dataset to keep legend stable across subsets.
+        merged_labels = {**group_labels, **gl}
+        _plot_teacher_group_adv_weight_lines_core(
+            group_pos_weights=gpw,
+            group_labels=merged_labels,
+            output_dir=output_dir,
+            out_filename=f"summary_opsd_advantage_weight_by_token_teacher_groups_{reward_tag}.png",
+            title_suffix=f", reward={reward_val}",
+            dpi=dpi,
+            min_count_per_pos=min_count_per_pos,
+            opsd_signal_window_size=opsd_signal_window_size,
+            opsd_advantage_weighting_epsilon=opsd_advantage_weighting_epsilon,
+            opsd_advantage_weighting_fn=opsd_advantage_weighting_fn,
+            opsd_advantage_weighting_sign_mode=opsd_advantage_weighting_sign_mode,
+        )
 
 
 def plot_per_request(
@@ -1060,12 +1446,58 @@ def main():
         default="equal_freq",
         help="Binning strategy for entropy mean line.",
     )
+    parser.add_argument(
+        "--opsd-advantage-weighting-fn",
+        choices=["sigmoid", "exp"],
+        default="sigmoid",
+        help=(
+            "Function used to map zscore(smoothed_delta) to token weight before clamp. "
+            "'sigmoid' (default): 2*sigmoid(z). "
+            "'exp': exp(z) (legacy behavior)."
+        ),
+    )
+    parser.add_argument(
+        "--opsd-advantage-weighting-sign-mode",
+        choices=["none", "flip_on_reward0"],
+        default="flip_on_reward0",
+        help=(
+            "Optional sign transform before weighting. "
+            "'none': use normalized signal as-is. "
+            "'flip_on_reward0' (default): when student_reward == 0, use -normalized signal."
+        ),
+    )
+    parser.add_argument(
+        "--opsd-advantage-weighting-epsilon",
+        type=float,
+        default=0.2,
+        help=(
+            "Epsilon for OPSD advantage weighting clamp. "
+            "Token weight from --opsd-advantage-weighting-fn is clipped to [1-eps, 1+eps]."
+        ),
+    )
+    parser.add_argument(
+        "--opsd-signal-window-size",
+        type=int,
+        default=128,
+        help=(
+            "Window size for OPSD centered moving-average smoothing before z-score "
+            "normalization when computing advantage weights from teacher-student token "
+            "deltas. Uses truncated boundaries; even windows are right-biased."
+        ),
+    )
     args = parser.parse_args()
 
     if args.y_min is not None and args.y_max is not None and args.y_min >= args.y_max:
         raise ValueError(f"--y-min must be smaller than --y-max, got y_min={args.y_min}, y_max={args.y_max}")
     if args.entropy_bin_count is not None and args.entropy_bin_count < 1:
         raise ValueError(f"--entropy-bin-count must be >= 1, got {args.entropy_bin_count}")
+    if args.opsd_signal_window_size < 1:
+        raise ValueError(f"--opsd-signal-window-size must be >= 1, got {args.opsd_signal_window_size}")
+    if args.opsd_advantage_weighting_epsilon < 0:
+        raise ValueError(
+            "--opsd-advantage-weighting-epsilon must be >= 0, "
+            f"got {args.opsd_advantage_weighting_epsilon}"
+        )
 
     records = load_records(args.input)
     output_dir = Path(args.output_dir)
@@ -1096,6 +1528,16 @@ def main():
         raw_alpha=args.raw_alpha,
         min_count_per_pos=args.min_count_per_pos,
         weighted_smooth=args.weighted_smooth,
+    )
+    plot_teacher_group_adv_weight_lines(
+        records,
+        output_dir=output_dir,
+        dpi=args.dpi,
+        min_count_per_pos=args.min_count_per_pos,
+        opsd_signal_window_size=args.opsd_signal_window_size,
+        opsd_advantage_weighting_epsilon=args.opsd_advantage_weighting_epsilon,
+        opsd_advantage_weighting_fn=args.opsd_advantage_weighting_fn,
+        opsd_advantage_weighting_sign_mode=args.opsd_advantage_weighting_sign_mode,
     )
     plot_entropy_vs_teacher_minus_student(
         records,

@@ -1351,6 +1351,93 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Default -1.0 (disabled, no clipping)."
                 ),
             )
+            parser.add_argument(
+                "--opsd-advantage-masking",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable OPSD-based token-level advantage masking for policy gradient loss. "
+                    "During the OPSD teacher forward pass, computes per-token sampled-token "
+                    "reverse KL signal: signal_t = log p_T(y_t) - log p_S(y_t). The signal is "
+                    "smoothed via centered moving average (--opsd-signal-window-size; truncated "
+                    "boundary, even windows right-biased) and "
+                    "then z-score normalized per response. The resulting normalized signal is "
+                    "used to mask GRPO token advantages: for positive-advantage responses, "
+                    "tokens with negative normalized signal are masked; for negative-advantage "
+                    "responses, tokens with positive normalized signal are masked. "
+                    "This keeps gradient updates only on tokens where teacher signal is "
+                    "consistent with the advantage direction. "
+                    "Requires --use-opd --opd-type=opsd. Does NOT use --opsd-jsd-coef "
+                    "(set it to 0); the teacher signal only affects pg_loss masking."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-signal-window-size",
+                type=int,
+                default=32,
+                help=(
+                    "Window size for centered moving-average smoothing of the OPSD token signal "
+                    "before z-score normalization (truncated boundary; even windows right-biased). "
+                    "Only used when --opsd-advantage-masking or --opsd-advantage-weighting is "
+                    "enabled. Larger windows produce smoother signals. Default 32."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-advantage-weighting",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable OPSD-based token-level advantage weighting for policy gradient loss. "
+                    "Computes per-token sampled-token signal: signal_t = log p_T(y_t) - log p_S(y_t), "
+                    "smoothed via centered moving average (--opsd-signal-window-size; truncated "
+                    "boundary, even windows right-biased) and "
+                    "z-score normalized per response. The weight for each token is "
+                    "selected by --opsd-advantage-weighting-fn: either exp(normalized_signal) "
+                    "or 2*sigmoid(normalized_signal). The resulting multiplier is clamped to "
+                    "[1 - epsilon, 1 + epsilon] where epsilon is set by "
+                    "--opsd-advantage-weighting-epsilon. This multiplicatively re-weights pg_loss "
+                    "per token. Can be combined with --opsd-advantage-masking. "
+                    "Requires --use-opd --opd-type=opsd."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-advantage-weighting-fn",
+                type=str,
+                choices=["sigmoid", "exp"],
+                default="sigmoid",
+                help=(
+                    "Function used to convert normalized OPSD signal into per-token advantage weights. "
+                    "'sigmoid' (default): weight = 2*sigmoid(normalized_signal). "
+                    "'exp': weight = exp(normalized_signal) (legacy behavior). "
+                    "In both cases, weights are clamped to [1 - epsilon, 1 + epsilon] with "
+                    "--opsd-advantage-weighting-epsilon."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-advantage-weighting-sign-mode",
+                type=str,
+                choices=["none", "flip_on_negative_advantage"],
+                default="flip_on_negative_advantage",
+                help=(
+                    "Optional sign transform applied to normalized OPSD signal before weighting. "
+                    "'none': use normalized signal as-is. "
+                    "'flip_on_negative_advantage' (default): for samples where mean token advantage < 0, "
+                    "use -normalized_signal when computing token weights; otherwise keep normalized_signal. "
+                    "Only affects --opsd-advantage-weighting, and does not change smoothing, z-score, "
+                    "or epsilon clamping."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-advantage-weighting-epsilon",
+                type=float,
+                default=0.2,
+                help=(
+                    "Epsilon for clamping the OPSD advantage weighting multiplier. "
+                    "The per-token multiplier from --opsd-advantage-weighting-fn is clamped to "
+                    "[1 - epsilon, 1 + epsilon]. Only used when --opsd-advantage-weighting is "
+                    "enabled. Default 0.2."
+                ),
+            )
             return parser
 
         def add_router_arguments(parser):

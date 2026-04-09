@@ -9,18 +9,18 @@ eval:
     max_response_len: 16384
     top_p: 0.95
   datasets:
-    # - name: aime24
-    #   path: /root/math/data/eval_aime24.jsonl
-    #   rm_type: math
-    #   n_samples_per_eval_prompt: 1
-    #   apply_chat_template_kwargs:
-    #     enable_thinking: false
-    # - name: aime25
-    #   path: /root/math/data/eval_aime25.jsonl
-    #   rm_type: math
-    #   n_samples_per_eval_prompt: 1
-    #   apply_chat_template_kwargs:
-    #     enable_thinking: false
+    - name: aime24
+      path: /root/math/data/eval_aime24.jsonl
+      rm_type: math
+      n_samples_per_eval_prompt: 1
+      apply_chat_template_kwargs:
+        enable_thinking: false
+    - name: aime25
+      path: /root/math/data/eval_aime25.jsonl
+      rm_type: math
+      n_samples_per_eval_prompt: 1
+      apply_chat_template_kwargs:
+        enable_thinking: false
     # - name: hmmt
     #   path: /root/math/data/eval_hmmt.jsonl
     #   rm_type: math

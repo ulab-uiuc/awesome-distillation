@@ -432,6 +432,8 @@ def _compute_opsd_jsd_in_forward(
     opsd_eos_values = []       # only populated when opsd_eos_loss_coef > 0
     opsd_gate_values = []      # only populated when loss_type == "kl_biased_ppo"
     opsd_clip_fracs = []       # only populated when opsd_token_clip > 0
+    opsd_token_signal_values = []  # only populated when opsd_advantage_masking is enabled
+    _compute_token_signal = getattr(args, "opsd_advantage_masking", False) or getattr(args, "opsd_advantage_weighting", False)
     _eos_max_len = float(getattr(args, "rollout_max_response_len", 8192) or 8192)
     student_end = 0
     teacher_end = 0
@@ -545,6 +547,18 @@ def _compute_opsd_jsd_in_forward(
 
         opsd_jsd_values.append(jsd)
 
+        # ---- OPSD advantage masking: sampled-token signal (optional) ----
+        # Compute log p_T(y_t) - log p_S(y_t) at each response token.
+        # This is detached (no gradient) and used only for masking in policy_loss_function.
+        if _compute_token_signal and resp_len > 0:
+            log_pi_T = compute_log_probs(
+                t_logits.float().clone(), response_tokens_i, tp_group
+            ).squeeze(-1)  # [resp_len]
+            log_pi_S = compute_log_probs(
+                s_logits.float().clone(), response_tokens_i, tp_group
+            ).squeeze(-1)  # [resp_len]
+            opsd_token_signal_values.append((log_pi_T - log_pi_S).detach())
+
         # ---- EOS encouragement loss (optional) ----
         # Compute -log p_S(EOS | context_t) * (t / max_len) for each response position.
         # Uses raw (non-temperature-scaled) student logits so the loss targets the
@@ -574,6 +588,8 @@ def _compute_opsd_jsd_in_forward(
         batch["opsd_gate_values"] = opsd_gate_values
     if opsd_clip_fracs:
         batch["opsd_clip_fracs"] = opsd_clip_fracs
+    if opsd_token_signal_values:
+        batch["opsd_token_signal"] = opsd_token_signal_values
 
 
 def _prefetch_opsd_teacher_logits(
@@ -749,12 +765,13 @@ def train_one_step(
         # ---- OPSD: teacher forward BEFORE student (to avoid autograd version mismatch) ----
         # Weight swap (ref → actor) must happen before model(**forward_kwargs) saves
         # tensor versions into ctx.saved_tensors. Teacher logits are stored in batch.
-        if (
+        _opsd_active = (
             args.use_opd
             and args.opd_type == "opsd"
-            and args.opsd_jsd_coef > 0
+            and (args.opsd_jsd_coef > 0 or getattr(args, "opsd_advantage_masking", False) or getattr(args, "opsd_advantage_weighting", False))
             and batch.get("teacher_tokens") is not None
-        ):
+        )
+        if _opsd_active:
             _prefetch_opsd_teacher_logits(args, model, batch)
 
         if return_schedule_plan:
@@ -788,13 +805,8 @@ def train_one_step(
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        # ---- OPSD: JSD computation AFTER student forward (teacher logits already prefetched) ----
-        if (
-            args.use_opd
-            and args.opd_type == "opsd"
-            and args.opsd_jsd_coef > 0
-            and batch.get("teacher_tokens") is not None
-        ):
+        # ---- OPSD: JSD/signal computation AFTER student forward (teacher logits already prefetched) ----
+        if _opsd_active:
             _compute_opsd_jsd_in_forward(args, model, batch, output_tensor)
 
         return output_tensor, partial(loss_function, args, batch, num_microbatches)
