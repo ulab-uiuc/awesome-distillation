@@ -8,7 +8,17 @@ docker run --name siqi_slime_opsd --gpus all --ipc=host --shm-size=64g \
   -it slimerl/slime:latest /bin/bash
 
 
+docker run --name siqi_slime_opsd_v2 --gpus all --ipc=host --shm-size=64g \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v /mnt/disk1_from_server2/siqizhu4/opsd_slime:/root/slime_siqi \
+  -v /mnt/disk1_from_server2/siqizhu4/ray_tmp:/tmp/ray_siqi \
+  -v /mnt/disk1_from_server2/siqizhu4/checkpoints:/root/checkpoints_siqi \
+  -v /mnt/disk1_from_server2/siqizhu4/hf_cache:/root/.cache/huggingface \
+  -w /root/slime_siqi \
+  -it slimerl/slime:latest /bin/bash
+
 /data/siqizhu4/opsd_slime
+examples/on_policy_distillation/run-qwen3-1.7B-opsd_grpo-openthoughts_baseline.sh
 
 docker run --name siqi_slime_opsd --gpus all --ipc=host -p 30000:30000 --shm-size=64g \
   --ulimit memlock=-1 --ulimit stack=67108864 \
@@ -77,8 +87,8 @@ CUDA_VISIBLE_DEVICES=7,8 python -m sglang.launch_server \
 
 
 export NCCL_P2P_DISABLE=1
-CUDA_VISIBLE_DEVICES=2,3,4,5 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-30B-A3B-Instruct-2507 \
+CUDA_VISIBLE_DEVICES=4,5,8,9 python -m sglang.launch_server \
+    --model-path /root/checkpoints_siqi/models--Qwen--Qwen3-30B-A3B-Instruct-2507 \
     --host 0.0.0.0 \
     --port 30000 \
     --context-length 32768 \
@@ -172,3 +182,5 @@ python examples/on_policy_distillation/plot_token_winner_interactive.py \
   --tokenizer Qwen/Qwen3-1.7B \
   --show-last-k-tokens 64
 
+
+ps -o pid,ppid,user,tty,lstart,cmd -p 314845

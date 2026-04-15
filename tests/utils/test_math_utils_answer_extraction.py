@@ -39,3 +39,9 @@ def test_grade_answer_verl_auto_accepts_boxed_fallback():
         "$$<|im_end|>"
     )
     assert grade_answer_verl(passage, "15x - 80", mode="auto")
+
+
+def test_grade_answer_verl_answer_mode_ignores_stray_latex_closing_brace(caplog):
+    with caplog.at_level("INFO", logger="pylatexenc.latexwalker"):
+        assert grade_answer_verl("Answer: \\frac{1}{2}}", "1/2", mode="answer")
+    assert "Ignoring parse error (tolerant parsing mode)" not in caplog.text

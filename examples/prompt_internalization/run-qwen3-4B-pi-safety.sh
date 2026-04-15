@@ -55,6 +55,10 @@
 #   export JUDGE_API_KEY=EMPTY
 #   export JUDGE_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507
 
+
+# python hf_download.py --model Qwen/Qwen3-30B-A3B-Instruct-2507 --save_dir ./hf_hub
+
+
 set -ex
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
@@ -177,7 +181,7 @@ GRPO_ARGS=(
     --opd-kl-coef 0.0
     --entropy-coef 0.00
 
-    # Periodic teacher refresh (Algorithm 1 in OPSD paper)
+    # Strict fixed teacher from --ref-load checkpoint (no periodic refresh)
     --opsd-use-ref-as-teacher
     --entropy-coef 0.00
 )
@@ -189,7 +193,7 @@ GRPO_ARGS=(
 OPTIMIZER_ARGS=(
     --optimizer adam
     --lr 1e-6
-    --lr-decay-style cosine
+    --lr-decay-style constant
     --lr-warmup-fraction 0.1
     --weight-decay 0.1
     --adam-beta1 0.9

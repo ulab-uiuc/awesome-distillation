@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
+from slime.utils.opsd_grpo_reward import recompute_local_opsd_grpo_r2_rewards
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -490,6 +491,56 @@ def apply_opd_kl_to_advantages(
     rollout_data["opd_reverse_kl"] = reverse_kls
 
 
+def _maybe_apply_opsd_grpo_r2_reward_bonus(args: Namespace, rollout_data: RolloutBatch) -> None:
+    alpha = float(getattr(args, "opsd_grpo_r2_alpha", 0.0))
+    sign_mode = str(getattr(args, "opsd_grpo_r2_sign_mode", "flip_on_reward0"))
+    if alpha <= 0.0:
+        return
+
+    raw_rewards_full = rollout_data.get("raw_reward")
+    local_batch_indices = rollout_data.get("batch_sample_indices")
+    local_gap_means = rollout_data.get("opsd_reward_gap_mean")
+    if raw_rewards_full is None:
+        raise ValueError("--opsd-grpo-r2-alpha requires raw_reward in rollout_data, but it is missing.")
+    if local_batch_indices is None:
+        raise ValueError("--opsd-grpo-r2-alpha requires batch_sample_indices in rollout_data, but they are missing.")
+    if local_gap_means is None:
+        raise ValueError(
+            "--opsd-grpo-r2-alpha requires opsd_reward_gap_mean in rollout_data, but it is missing. "
+            "Make sure the Megatron actor pre-computed teacher-vs-rollout gap means."
+        )
+
+    local_batch_indices = [int(idx) for idx in local_batch_indices]
+    local_gap_means = [float(value) for value in local_gap_means]
+    if len(local_batch_indices) != len(local_gap_means):
+        raise ValueError(
+            "--opsd-grpo-r2-alpha local batch-index/gap count mismatch: "
+            f"{len(local_batch_indices)} vs {len(local_gap_means)}."
+        )
+
+    dp_world_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+    if dp_world_size > 1:
+        dp_group = mpu.get_data_parallel_group_gloo(with_context_parallel=True)
+        gathered_batch_indices: list[list[int] | None] = [None] * dp_world_size
+        gathered_gap_means: list[list[float] | None] = [None] * dp_world_size
+        dist.all_gather_object(gathered_batch_indices, local_batch_indices, group=dp_group)
+        dist.all_gather_object(gathered_gap_means, local_gap_means, group=dp_group)
+    else:
+        gathered_batch_indices = [local_batch_indices]
+        gathered_gap_means = [local_gap_means]
+
+    local_reward_payload = recompute_local_opsd_grpo_r2_rewards(
+        raw_rewards_full=[float(value) for value in raw_rewards_full],
+        local_batch_indices=local_batch_indices,
+        gathered_batch_indices=[[int(idx) for idx in shard] for shard in gathered_batch_indices],
+        gathered_gap_means=[[float(value) for value in shard] for shard in gathered_gap_means],
+        alpha=alpha,
+        sign_mode=sign_mode,
+        n_samples_per_prompt=int(getattr(args, "n_samples_per_prompt", 1)),
+    )
+    rollout_data.update(local_reward_payload)
+
+
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
 
@@ -511,6 +562,9 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             "total_lengths"). Modified in-place to add "advantages" and
             "returns" keys, each mapping to lists of tensors per sample.
     """
+    if mpu.is_pipeline_last_stage():
+        _maybe_apply_opsd_grpo_r2_reward_bonus(args, rollout_data)
+
     log_probs: list[torch.Tensor] = rollout_data.get("rollout_log_probs" if args.use_rollout_logprobs else "log_probs")
     ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
     rewards: list[float] = rollout_data.get("rewards")
@@ -704,6 +758,36 @@ def icepop_function(
     return pg_loss, loss_masks, metrics
 
 
+def _compute_opsd_center_and_scale(
+    smoothed: torch.Tensor,
+    normalization_mode: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mode = str(normalization_mode).strip().lower()
+
+    if mode == "standard":
+        center = smoothed.mean()
+        scale = smoothed.std()
+        if not torch.isfinite(scale):
+            scale = smoothed.std(unbiased=False)
+    elif mode == "robust":
+        center = smoothed.median()
+        mad = (smoothed - center).abs().median()
+        scale = 1.4826 * mad
+        if not torch.isfinite(scale) or scale < 1e-8:
+            scale = smoothed.std()
+            if not torch.isfinite(scale):
+                scale = smoothed.std(unbiased=False)
+    else:
+        raise ValueError(
+            "Unsupported --opsd-advantage-normalization: "
+            f"{normalization_mode!r}. Expected one of ['standard', 'robust']."
+        )
+
+    if not torch.isfinite(scale):
+        scale = torch.zeros_like(center)
+    return center, scale.clamp(min=1e-8)
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -833,7 +917,7 @@ def policy_loss_function(
         pg_loss = pg_loss * opsm_mask
 
     # ---- OPSD advantage masking & weighting (optional) ----
-    # Both features share the same smoothed & z-score normalized signal pipeline.
+    # Both features share the same smoothed & normalized signal pipeline.
     # Masking: zero out pg_loss for tokens inconsistent with advantage direction.
     # Weighting: multiply pg_loss by a configurable function of normalized_signal
     # (exp or 2*sigmoid), then clamp to [1-eps, 1+eps].
@@ -846,6 +930,7 @@ def policy_loss_function(
         opsd_token_signal_list = batch["opsd_token_signal"]
         advantages_list = batch["advantages"]
         window_size = getattr(args, "opsd_signal_window_size", 32)
+        normalization_mode = str(getattr(args, "opsd_advantage_normalization", "standard")).lower()
         weighting_eps = getattr(args, "opsd_advantage_weighting_epsilon", 0.2)
         weighting_fn = str(getattr(args, "opsd_advantage_weighting_fn", "sigmoid")).lower()
         weighting_sign_mode = str(
@@ -881,10 +966,9 @@ def policy_loss_function(
             else:
                 smoothed = signal_i
 
-            # 2. Z-score normalization
-            mean = smoothed.mean()
-            std = smoothed.std().clamp(min=1e-8)
-            normalized = (smoothed - mean) / std
+            # 2. Per-response normalization of the smoothed signal.
+            center, scale = _compute_opsd_center_and_scale(smoothed, normalization_mode=normalization_mode)
+            normalized = (smoothed - center) / scale
 
             # Collect normalized signal for logging
             opsd_normalized_signal_list.append(normalized.detach())
@@ -917,6 +1001,7 @@ def policy_loss_function(
                         "['none', 'flip_on_negative_advantage']."
                     )
 
+                normalized_for_weight = normalized_for_weight.clamp(min=-60.0, max=60.0)
                 if weighting_fn == "exp":
                     token_weight_raw = torch.exp(normalized_for_weight)
                 elif weighting_fn == "sigmoid":
@@ -1544,17 +1629,40 @@ def loss_function(
     else:
         loss = loss * mpu.get_context_parallel_world_size()
 
+    # These metrics are already normalized scalars inside policy_loss_function.
+    # Multiply them back by the step normalizer so the outer train-step reducer
+    # does not divide them by sample count a second time.
+    pre_averaged_metric_keys = {
+        "opsd_adv_mask_ratio",
+        "opsd_adv_weight_mean",
+        "opsd_norm_signal_pos_frac",
+        "opsd_norm_signal_neg_frac",
+        "opd_distill_active_ratio",
+        "opd_distill_skip_ratio",
+    }
+
+    step_normalizer = (
+        num_tokens.to(device=logits.device, dtype=torch.float32)
+        if args.calculate_per_token_loss
+        else torch.tensor(float(num_samples), device=logits.device)
+    )
+
+    packed_log_values = []
+    for key, value in log.items():
+        value_tensor = (
+            value.to(device=logits.device, dtype=torch.float32)
+            if isinstance(value, torch.Tensor)
+            else torch.tensor(float(value), device=logits.device)
+        )
+        if key in pre_averaged_metric_keys:
+            value_tensor = value_tensor * step_normalizer
+        packed_log_values.append(value_tensor)
+
     return (
         loss,
         (num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
         {
             "keys": list(log.keys()),
-            "values": torch.tensor(
-                [
-                    num_samples if not args.calculate_per_token_loss else num_tokens,
-                ]
-                + list(log.values()),
-                device=logits.device,
-            ),
+            "values": torch.stack([step_normalizer] + packed_log_values),
         },
     )

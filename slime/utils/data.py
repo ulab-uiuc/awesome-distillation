@@ -286,6 +286,10 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     rollout_data = ray.get(rollout_data_ref[dp_rank].inner)
 
     partition = rollout_data.pop("partition")
+    if "batch_sample_indices" not in rollout_data:
+        rollout_data["batch_sample_indices"] = [int(i) for i in partition]
+    else:
+        rollout_data["batch_sample_indices"] = [int(i) for i in rollout_data["batch_sample_indices"]]
     total_lengths = rollout_data["total_lengths"]
 
     # save the seqlen of the whole rollout batch

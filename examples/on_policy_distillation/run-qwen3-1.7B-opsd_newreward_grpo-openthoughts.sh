@@ -1,18 +1,20 @@
 #!/bin/bash
 
-# OPSD Masked GRPO: GRPO policy gradient with OPSD token-level advantage masking
+# OPSD Weighted GRPO: GRPO policy gradient with OPSD token-level advantage weighting
 # Training dataset: open-thoughts/OpenThoughts-114k
 #
 # Algorithm:
 #   - Standard GRPO with n_samples_per_prompt=8 for proper group normalization
 #   - OPSD teacher forward computes per-token signal: log p_T(y_t) - log p_S(y_t)
-#   - Signal is smoothed (sliding window avg, window=32) and z-score normalized
-#   - Token masking on pg_loss:
-#       * Positive advantage responses: mask tokens where normalized signal < 0
-#       * Negative advantage responses: mask tokens where normalized signal > 0
-#   - NO JSD distillation loss (opsd_jsd_coef=0); teacher signal only for masking
+#   - Signal is smoothed (sliding window avg, window=32) and normalized
+#     (mean/std or robust median/MAD)
+#   - Token weighting on pg_loss:
+#       * Positive advantage responses: up-weight teacher-aligned tokens
+#       * Negative advantage responses: flip the signal sign, then up-weight tokens
+#         aligned with the negative-advantage direction
+#   - NO JSD distillation loss (opsd_jsd_coef=0); teacher signal only for weighting
 #
-# Usage: bash examples/on_policy_distillation/run-qwen3-1.7B-opsd_masked_grpo-openthoughts.sh
+# Usage: bash examples/on_policy_distillation/run-qwen3-1.7B-opsd_weighted_grpo-openthoughts.sh
 
 set -ex
 export NCCL_P2P_DISABLE=1
@@ -42,8 +44,6 @@ PREPROCESS="python3 examples/on_policy_distillation/preprocess_dataset.py"
 TRAIN_OUT="/root/math/data/train_openthoughts_math.jsonl"
 TRAIN_ANSWER_FORMAT="${TRAIN_ANSWER_FORMAT:-boxed}"
 EVAL_ANSWER_FORMAT="${EVAL_ANSWER_FORMAT:-boxed}"
-EXPERIMENT_SEED="${EXPERIMENT_SEED:-1234}"
-ROLLOUT_SEED="${ROLLOUT_SEED:-1234}"
 
 python3 examples/on_policy_distillation/filter_openthoughts_math.py \
     --output "$TRAIN_OUT" \
@@ -55,6 +55,9 @@ $PREPROCESS --dataset math-ai/aime25             --split test  --output /root/ma
 $PREPROCESS --dataset FlagEval/HMMT_2025         --split train --output /root/math/data/eval_hmmt.jsonl      --answer-format "$EVAL_ANSWER_FORMAT"
 $PREPROCESS --dataset meituan-longcat/AMO-Bench  --split test  --output /root/math/data/eval_amo_bench.jsonl --answer-format "$EVAL_ANSWER_FORMAT"
 $PREPROCESS --dataset HuggingFaceH4/MATH-500     --split test  --output /root/math/data/eval_math500.jsonl   --answer-format "$EVAL_ANSWER_FORMAT"
+
+OPSD_GRPO_R2_ALPHA="${OPSD_GRPO_R2_ALPHA:-0.2}"
+OPSD_GRPO_R2_SIGN_MODE="${OPSD_GRPO_R2_SIGN_MODE:-flip_on_reward0}"
 
 
 ###############################################################################
@@ -72,11 +75,10 @@ ROLLOUT_ARGS=(
    --prompt-data "$TRAIN_OUT"
    --input-key prompt
    --label-key label
-   --rollout-seed "${ROLLOUT_SEED}"
    --apply-chat-template
    --apply-chat-template-kwargs '{"enable_thinking":false}'
    --rollout-shuffle
-   --num-rollout 100
+   --num-rollout 1000
    --rollout-batch-size 16
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
@@ -96,6 +98,7 @@ RM_ARGS=(
 EVAL_ARGS=(
     --eval-interval 10
     --eval-config examples/on_policy_distillation/eval_config.yaml
+    --eval-temperature 0.6
     --log-passrate
 )
 
@@ -129,8 +132,29 @@ GRPO_ARGS=(
    --opsd-jsd-coef 0.0
 
    # OPSD advantage masking: the core masking feature
-   --opsd-advantage-masking
-   --opsd-signal-window-size 32
+   # --opsd-advantage-masking
+   # OPSD advantage weighting: configurable multiplier on normalized signal.
+   # Default is sigmoid -> 2*sigmoid(normalized_signal), can switch to legacy exp.
+   # Sign mode default flips z -> -z for samples with mean advantage < 0.
+   # Normalization default is robust in this recipe to reduce outlier sensitivity.
+   # Override with env vars:
+   #   OPSD_ADVANTAGE_WEIGHTING_FN=exp
+   #   OPSD_ADV_WEIGHT_SIGN_MODE=none
+   #   OPSD_ADVANTAGE_NORMALIZATION=standard
+
+   # --opsd-advantage-weighting
+   # --opsd-advantage-weighting-fn "${OPSD_ADVANTAGE_WEIGHTING_FN:-sigmoid}"
+   # --opsd-advantage-weighting-sign-mode "${OPSD_ADV_WEIGHT_SIGN_MODE:-flip_on_negative_advantage}"
+   # --opsd-advantage-normalization "${OPSD_ADVANTAGE_NORMALIZATION:-robust}"
+   # --opsd-advantage-weighting-epsilon 0.30
+   # --opsd-signal-window-size 32
+
+   # Scalar reward bonus: task_reward +/- alpha * R2, where R2 is prompt-group
+   # min-max normalization of mean_t[log p_T(y_t) - log p_S_rollout(y_t)].
+   # Default sign mode for this recipe is reward=0 -> subtract alpha * R2.
+   # This is orthogonal to --opsd-advantage-weighting above, which only reweights pg_loss per token.
+   --opsd-grpo-r2-alpha "${OPSD_GRPO_R2_ALPHA}"
+   --opsd-grpo-r2-sign-mode "${OPSD_GRPO_R2_SIGN_MODE}"
 
    --opsd-teacher-think-max-tokens -1
 
@@ -154,7 +178,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-opsd_masked_grpo-openthoughts_nothinking
+   --wandb-group qwen3-1.7B-opsd_R2_ALPHA_0.2_reward0-minus-R2_grpo-openthoughts-nothinking
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -164,11 +188,10 @@ SGLANG_ARGS=(
 )
 
 MISC_ARGS=(
-   --seed "${EXPERIMENT_SEED}"
    --attention-dropout 0.0
    --hidden-dropout 0.0
-   --use-fault-tolerance
    --accumulate-allreduce-grads-in-fp32
+   --use-fault-tolerance
    --attention-softmax-in-fp32
    --attention-backend flash
    --log-probs-chunk-size 512
@@ -180,7 +203,7 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=1,2,3,6
+export CUDA_VISIBLE_DEVICES=6,7,8,9
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 
@@ -191,7 +214,7 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "1,2,3,6"
+        "CUDA_VISIBLE_DEVICES": "6,7,8,9"
      }
    }' \
    -- python3 train.py \

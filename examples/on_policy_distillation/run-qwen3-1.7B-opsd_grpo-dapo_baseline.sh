@@ -1,18 +1,14 @@
 #!/bin/bash
 
-# OPSD Masked GRPO: GRPO policy gradient with OPSD token-level advantage masking
+# Standard GRPO baseline: no OPSD teacher signal, no masking, no weighting
 # Training dataset: open-thoughts/OpenThoughts-114k
 #
 # Algorithm:
 #   - Standard GRPO with n_samples_per_prompt=8 for proper group normalization
-#   - OPSD teacher forward computes per-token signal: log p_T(y_t) - log p_S(y_t)
-#   - Signal is smoothed (sliding window avg, window=32) and z-score normalized
-#   - Token masking on pg_loss:
-#       * Positive advantage responses: mask tokens where normalized signal < 0
-#       * Negative advantage responses: mask tokens where normalized signal > 0
-#   - NO JSD distillation loss (opsd_jsd_coef=0); teacher signal only for masking
+#   - No OPSD teacher forward
+#   - No token masking or weighting on pg_loss
 #
-# Usage: bash examples/on_policy_distillation/run-qwen3-1.7B-opsd_masked_grpo-openthoughts.sh
+# Usage: bash examples/on_policy_distillation/run-qwen3-1.7B-opsd_masked_grpo-openthoughts_baseline.sh
 
 set -ex
 export NCCL_P2P_DISABLE=1
@@ -32,6 +28,7 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 source "/root/slime_siqi/scripts/models/qwen3-1.7B.sh"
 
+
 ###############################################################################
 # Step 0: Preprocess datasets
 ###############################################################################
@@ -39,15 +36,23 @@ source "/root/slime_siqi/scripts/models/qwen3-1.7B.sh"
 PREPROCESS="python3 examples/on_policy_distillation/preprocess_dataset.py"
 
 # ---- Training dataset -------------------------------------------------------
-TRAIN_OUT="/root/math/data/train_openthoughts_math.jsonl"
+
+TRAIN_DATASET="${TRAIN_DATASET:-BytedTsinghua-SIA/DAPO-Math-17k}"
+TRAIN_CONFIG="${TRAIN_CONFIG:-}"   # DAPO does not require a config subset
+TRAIN_OUT="/root/math/data/train_dapo.jsonl"
+
+# EVAL datasets use boxed by default.
 TRAIN_ANSWER_FORMAT="${TRAIN_ANSWER_FORMAT:-boxed}"
 EVAL_ANSWER_FORMAT="${EVAL_ANSWER_FORMAT:-boxed}"
 EXPERIMENT_SEED="${EXPERIMENT_SEED:-1234}"
 ROLLOUT_SEED="${ROLLOUT_SEED:-1234}"
 
-python3 examples/on_policy_distillation/filter_openthoughts_math.py \
-    --output "$TRAIN_OUT" \
-    --answer-format "$TRAIN_ANSWER_FORMAT"
+
+TRAIN_ARGS=(--dataset "$TRAIN_DATASET" --split train --output "$TRAIN_OUT" --answer-format "$TRAIN_ANSWER_FORMAT")
+[ -n "$TRAIN_CONFIG" ] && TRAIN_ARGS+=(--config "$TRAIN_CONFIG")
+$PREPROCESS "${TRAIN_ARGS[@]}"
+
+
 
 # ---- Eval datasets ----------------------------------------------------------
 $PREPROCESS --dataset math-ai/aime24             --split test  --output /root/math/data/eval_aime24.jsonl    --answer-format "$EVAL_ANSWER_FORMAT"
@@ -64,7 +69,7 @@ $PREPROCESS --dataset HuggingFaceH4/MATH-500     --split test  --output /root/ma
 CKPT_ARGS=(
    --hf-checkpoint Qwen/Qwen3-1.7B
    --ref-load "/root/checkpoints_siqi/Qwen3-1.7B_torch_dist"
-   --save /root/slime_siqi/output/Qwen3-1.7B_opsd_masked_grpo_openthoughts/
+   --save /root/slime_siqi/output/Qwen3-1.7B_opsd_masked_grpo_dapo/
    --save-interval 2000
 )
 
@@ -76,7 +81,7 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --apply-chat-template-kwargs '{"enable_thinking":false}'
    --rollout-shuffle
-   --num-rollout 100
+   --num-rollout 1000
    --rollout-batch-size 16
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
@@ -96,11 +101,12 @@ RM_ARGS=(
 EVAL_ARGS=(
     --eval-interval 10
     --eval-config examples/on_policy_distillation/eval_config.yaml
+    --eval-temperature 0.6
     --log-passrate
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 1
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -112,33 +118,20 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 4096
+   --max-tokens-per-gpu 8192
 )
 
 GRPO_ARGS=(
-   --advantage-estimator grpo
-
-   # OPSD setup: teacher forward for signal, but NO JSD loss
-   --use-opd
-   --opd-type opsd
-   --opd-kl-coef 0.0
-
-   --opsd-teacher-info-mode full
-
-   # No JSD distillation loss — signal is only used for pg_loss masking
-   --opsd-jsd-coef 0.0
-
-   # OPSD advantage masking: the core masking feature
-   --opsd-advantage-masking
-   --opsd-signal-window-size 32
-
-   --opsd-teacher-think-max-tokens -1
-
-   --opsd-use-ref-as-teacher
-   --entropy-coef 0.00
-
    --use-kl-loss
    --kl-loss-coef 0.0
+
+   --advantage-estimator grpo
+   --use-kl-loss
+   --kl-loss-coef 0.00
+   --kl-loss-type low_var_kl
+   --entropy-coef 0.00
+   --eps-clip 0.2
+   --eps-clip-high 0.28
 )
 
 OPTIMIZER_ARGS=(
@@ -154,7 +147,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-opsd_masked_grpo-openthoughts_nothinking
+   --wandb-group qwen3-1.7B-opsd_baseline_grpo-dapo-nothinking
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -180,8 +173,8 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=1,2,3,6
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export CUDA_VISIBLE_DEVICES=6,8,9
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 3 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 
 set +e
@@ -191,12 +184,12 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "1,2,3,6"
+        "CUDA_VISIBLE_DEVICES": "6,8,9"
      }
    }' \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 2 \
+   --actor-num-gpus-per-node 1 \
    --rollout-num-gpus 2 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \

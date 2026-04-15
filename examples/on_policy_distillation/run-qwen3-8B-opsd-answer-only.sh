@@ -143,7 +143,8 @@ CKPT_ARGS=(
    --ref-load "/root/Qwen3-8B_torch_dist"
    --save /root/slime_siqi/output/Qwen3-8B_opsd_answer_only/
    --save-interval 2000
-   --ref-update-interval 20
+   # Strict fixed-teacher mode: do not combine with --ref-update-interval.
+   # --ref-update-interval 20
 )
 
 ROLLOUT_ARGS=(

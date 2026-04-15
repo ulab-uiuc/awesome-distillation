@@ -1191,10 +1191,35 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help=(
-                    "When enabled, OPSD teacher forward pass uses the REF model weights (loaded via --ref-load) "
-                    "instead of the current student model weights. This is equivalent to fixed_teacher=True in "
-                    "opsd_ucla: the teacher is the initial (step-0) policy and never updates, providing a stable "
-                    "distillation target throughout training. Recommended for reproducing paper results."
+                    "When enabled, OPSD teacher forward pass uses REF weights (loaded via --ref-load) as a strict "
+                    "fixed teacher instead of live student weights. The teacher remains frozen to the initial "
+                    "checkpoint and must not be combined with --ref-update-interval."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-grpo-r2-alpha",
+                type=float,
+                default=0.0,
+                help=(
+                    "Coefficient for the OPSD-GRPO R2 reward bonus. When > 0, before GRPO advantages are "
+                    "computed we estimate a per-sample scalar gap "
+                    "mean_t[log p_teacher(y_t) - log p_rollout_student(y_t)] on sampled response tokens, "
+                    "apply prompt-group min-max normalization to map that gap to R2 in [0, 1], then add the "
+                    "signed alpha * R2 term selected by --opsd-grpo-r2-sign-mode before the usual group "
+                    "normalization. Only supported for Megatron OPSD with --advantage-estimator=grpo and "
+                    "--n-samples-per-prompt > 1. Default 0.0 disables the feature."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-grpo-r2-sign-mode",
+                type=str,
+                choices=["none", "flip_on_reward0"],
+                default="flip_on_reward0",
+                help=(
+                    "Controls how the OPSD-GRPO alpha * R2 term is signed before GRPO group normalization. "
+                    "'none': always use task_reward + alpha * R2 (legacy behavior). "
+                    "'flip_on_reward0' (default): when raw scalar reward == 0.0, use task_reward - alpha * R2; "
+                    "otherwise keep task_reward + alpha * R2."
                 ),
             )
             parser.add_argument(
@@ -1360,8 +1385,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "During the OPSD teacher forward pass, computes per-token sampled-token "
                     "reverse KL signal: signal_t = log p_T(y_t) - log p_S(y_t). The signal is "
                     "smoothed via centered moving average (--opsd-signal-window-size; truncated "
-                    "boundary, even windows right-biased) and "
-                    "then z-score normalized per response. The resulting normalized signal is "
+                    "boundary, even windows right-biased) and then normalized per response with "
+                    "--opsd-advantage-normalization. The resulting normalized signal is "
                     "used to mask GRPO token advantages: for positive-advantage responses, "
                     "tokens with negative normalized signal are masked; for negative-advantage "
                     "responses, tokens with positive normalized signal are masked. "
@@ -1377,9 +1402,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=32,
                 help=(
                     "Window size for centered moving-average smoothing of the OPSD token signal "
-                    "before z-score normalization (truncated boundary; even windows right-biased). "
+                    "before --opsd-advantage-normalization is applied (truncated boundary; even "
+                    "windows right-biased). "
                     "Only used when --opsd-advantage-masking or --opsd-advantage-weighting is "
                     "enabled. Larger windows produce smoother signals. Default 32."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-advantage-normalization",
+                type=str,
+                choices=["standard", "robust"],
+                default="standard",
+                help=(
+                    "Normalization applied to the smoothed OPSD token signal before masking or "
+                    "weighting. 'standard' (default) uses mean/std per response to preserve the "
+                    "existing training behavior. 'robust' uses median/MAD to reduce outlier "
+                    "sensitivity."
                 ),
             )
             parser.add_argument(
@@ -1390,8 +1428,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Enable OPSD-based token-level advantage weighting for policy gradient loss. "
                     "Computes per-token sampled-token signal: signal_t = log p_T(y_t) - log p_S(y_t), "
                     "smoothed via centered moving average (--opsd-signal-window-size; truncated "
-                    "boundary, even windows right-biased) and "
-                    "z-score normalized per response. The weight for each token is "
+                    "boundary, even windows right-biased) and normalized per response with "
+                    "--opsd-advantage-normalization. The weight for each token is "
                     "selected by --opsd-advantage-weighting-fn: either exp(normalized_signal) "
                     "or 2*sigmoid(normalized_signal). The resulting multiplier is clamped to "
                     "[1 - epsilon, 1 + epsilon] where epsilon is set by "
@@ -2052,6 +2090,16 @@ def slime_validate_args(args):
                 raise ValueError("OPSD requires --pipeline-model-parallel-size 1.")
             if args.context_parallel_size > 1:
                 raise ValueError("OPSD requires --context-parallel-size 1.")
+            if getattr(args, "opsd_use_ref_as_teacher", False):
+                if args.ref_load is None:
+                    raise ValueError("--opsd-use-ref-as-teacher requires --ref-load to be set.")
+                if not os.path.exists(args.ref_load):
+                    raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
+                if args.ref_update_interval is not None:
+                    raise ValueError(
+                        "--opsd-use-ref-as-teacher uses a strict fixed teacher and cannot be combined "
+                        "with --ref-update-interval."
+                    )
     else:
         # If OPD is not enabled, opd_teacher_load should not be set
         if args.opd_teacher_load is not None:
@@ -2063,6 +2111,19 @@ def slime_validate_args(args):
 
     if getattr(args, "opd_explicit_loss_coef", 0.0) > 0 and getattr(args, "opd_type", None) != "sglang":
         raise ValueError("--opd-explicit-loss-coef currently only supports --opd-type=sglang.")
+
+    if getattr(args, "opsd_grpo_r2_alpha", 0.0) < 0:
+        raise ValueError("--opsd-grpo-r2-alpha must be >= 0.")
+
+    if getattr(args, "opsd_grpo_r2_alpha", 0.0) > 0:
+        if not args.use_opd:
+            raise ValueError("--opsd-grpo-r2-alpha requires --use-opd.")
+        if getattr(args, "opd_type", None) != "opsd":
+            raise ValueError("--opsd-grpo-r2-alpha only supports --opd-type=opsd.")
+        if args.advantage_estimator != "grpo":
+            raise ValueError("--opsd-grpo-r2-alpha currently only supports --advantage-estimator=grpo.")
+        if getattr(args, "n_samples_per_prompt", 1) <= 1:
+            raise ValueError("--opsd-grpo-r2-alpha requires --n-samples-per-prompt > 1.")
 
     if args.megatron_to_hf_mode == "bridge":
         if (

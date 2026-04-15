@@ -622,6 +622,8 @@ class RolloutManager:
             rollout_data = {}
             partition = partitions[i]
             rollout_data["partition"] = partition
+            # Preserve step-local sample positions alongside global sample_indices.
+            rollout_data["batch_sample_indices"] = [int(j) for j in partition]
             for key in [
                 "tokens",
                 "multimodal_train_inputs",

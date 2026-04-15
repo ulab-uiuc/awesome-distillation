@@ -190,12 +190,10 @@ async def compute_safety_reward(
     """
     metadata = metadata or {}
 
-    # Env var takes priority over metadata so that judge mode can be switched
-    # at runtime without re-preprocessing the dataset.
-    mode = (
-        os.environ.get("JUDGE_MODE")
-        # or metadata.get("judge_mode", "keyword")
-    )
+    # Env var takes priority so judge mode can be switched at runtime without
+    # re-preprocessing the dataset, but we still need the dataset metadata as
+    # the fallback for eval sets that were prepared with a specific judge mode.
+    mode = os.environ.get("JUDGE_MODE") or metadata.get("judge_mode", "keyword")
 
     if mode == "llm":
         api_base = (

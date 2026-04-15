@@ -35,12 +35,12 @@ eval:
     #   n_samples_per_eval_prompt: 1
     #   apply_chat_template_kwargs:
     #     enable_thinking: false
-    # - name: wildguardtest
-    #   path: /root/slime_siqi/data/pi_safety/eval_wildguardtest.jsonl
-    #   rm_type: safety
-    #   n_samples_per_eval_prompt: 1
-    #   apply_chat_template_kwargs:
-    #     enable_thinking: false
+    - name: wildguardtest
+      path: /root/slime_siqi/data/pi_safety/eval_wildguardtest.jsonl
+      rm_type: safety
+      n_samples_per_eval_prompt: 1
+      apply_chat_template_kwargs:
+        enable_thinking: false
     - name: bullshit_benchmark
       path: /root/slime_siqi/data/pi_safety/eval_bullshit.jsonl
       rm_type: bullshit

@@ -215,16 +215,45 @@ def _smooth_series_weighted(y: np.ndarray, weights: np.ndarray, window: int) -> 
     return num / den
 
 
+def _compute_center_and_scale(values: np.ndarray, normalization_mode: str) -> tuple[float, float]:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return 0.0, 1e-8
+
+    mode = str(normalization_mode).strip().lower()
+    if mode == "standard":
+        center = float(np.mean(finite))
+        scale = float(np.std(finite))
+    elif mode == "robust":
+        center = float(np.median(finite))
+        mad = float(np.median(np.abs(finite - center)))
+        scale = 1.4826 * mad
+        if not np.isfinite(scale) or scale < 1e-8:
+            scale = float(np.std(finite))
+    else:
+        raise ValueError(
+            "Unsupported opsd advantage normalization mode: "
+            f"{normalization_mode!r}. Expected one of ['standard', 'robust']."
+        )
+
+    if not np.isfinite(scale):
+        scale = 0.0
+    return center, max(scale, 1e-8)
+
+
 def compute_opsd_advantage_weights_from_delta(
     delta: np.ndarray,
     window_size: int,
     epsilon: float,
     weighting_fn: str = "sigmoid",
     flip_sign: bool = False,
+    normalization_mode: str = "robust",
 ) -> np.ndarray:
-    """Mirror OPSD advantage-weighting in training:
-    delta -> centered moving average (truncated boundary, even window right-biased)
-    -> z-score -> optional sign flip -> configurable weighting fn -> clamp.
+    """Plot OPSD-style advantage weights from token deltas.
+
+    normalization_mode='standard' mirrors training mean/std z-score behavior.
+    normalization_mode='robust' uses median/MAD to reduce outlier-driven bias.
     """
     signal = np.asarray(delta, dtype=np.float64)
     if signal.size == 0:
@@ -263,17 +292,16 @@ def compute_opsd_advantage_weights_from_delta(
     else:
         smoothed = signal
 
-    mean = float(np.mean(smoothed))
-    std = float(np.std(smoothed))
-    if not np.isfinite(std):
-        std = 0.0
-    std = max(std, 1e-8)
-    normalized = (smoothed - mean) / std
+    center, scale = _compute_center_and_scale(smoothed, normalization_mode=normalization_mode)
+    normalized = (smoothed - center) / scale
 
     eps = float(epsilon)
     lo = 1.0 - eps
     hi = 1.0 + eps
     normalized_for_weight = -normalized if flip_sign else normalized
+    # Keep exponentials numerically stable when a response is nearly constant or
+    # when robust scaling yields a very small denominator.
+    normalized_for_weight = np.clip(normalized_for_weight, -60.0, 60.0)
     fn = str(weighting_fn).strip().lower()
     if fn == "exp":
         raw_weights = np.exp(normalized_for_weight)
@@ -908,6 +936,7 @@ def collect_teacher_group_weight_data(
     opsd_advantage_weighting_epsilon: float,
     opsd_advantage_weighting_fn: str,
     opsd_advantage_weighting_sign_mode: str,
+    opsd_advantage_normalization: str,
 ) -> tuple[dict[int, dict[int, list[float]]], dict[int, str]]:
     """Collect per-group, per-position OPSD advantage weights from teacher-student deltas."""
     group_pos_weights: dict[int, dict[int, list[float]]] = {}
@@ -956,6 +985,7 @@ def collect_teacher_group_weight_data(
                 epsilon=opsd_advantage_weighting_epsilon,
                 weighting_fn=opsd_advantage_weighting_fn,
                 flip_sign=flip_sign,
+                normalization_mode=opsd_advantage_normalization,
             )
             for pos, w in enumerate(weights):
                 if np.isfinite(w):
@@ -976,6 +1006,7 @@ def _plot_teacher_group_adv_weight_lines_core(
     opsd_advantage_weighting_epsilon: float,
     opsd_advantage_weighting_fn: str,
     opsd_advantage_weighting_sign_mode: str,
+    opsd_advantage_normalization: str,
 ):
     if not group_pos_weights:
         return
@@ -1033,7 +1064,7 @@ def _plot_teacher_group_adv_weight_lines_core(
     ax.set_title(
         "OPSD advantage weight by token position "
         f"(fn={opsd_advantage_weighting_fn}, sign_mode={opsd_advantage_weighting_sign_mode}, "
-        f"window={opsd_signal_window_size}, "
+        f"norm={opsd_advantage_normalization}, window={opsd_signal_window_size}, "
         f"epsilon={opsd_advantage_weighting_epsilon}{title_suffix})"
     )
     ax.grid(alpha=0.22)
@@ -1066,6 +1097,7 @@ def plot_teacher_group_adv_weight_lines(
     opsd_advantage_weighting_epsilon: float,
     opsd_advantage_weighting_fn: str,
     opsd_advantage_weighting_sign_mode: str,
+    opsd_advantage_normalization: str,
 ):
     # --- Original plot (all records) ---
     group_pos_weights, group_labels = collect_teacher_group_weight_data(
@@ -1074,6 +1106,7 @@ def plot_teacher_group_adv_weight_lines(
         opsd_advantage_weighting_epsilon=opsd_advantage_weighting_epsilon,
         opsd_advantage_weighting_fn=opsd_advantage_weighting_fn,
         opsd_advantage_weighting_sign_mode=opsd_advantage_weighting_sign_mode,
+        opsd_advantage_normalization=opsd_advantage_normalization,
     )
     if not group_pos_weights:
         print(
@@ -1094,6 +1127,7 @@ def plot_teacher_group_adv_weight_lines(
         opsd_advantage_weighting_epsilon=opsd_advantage_weighting_epsilon,
         opsd_advantage_weighting_fn=opsd_advantage_weighting_fn,
         opsd_advantage_weighting_sign_mode=opsd_advantage_weighting_sign_mode,
+        opsd_advantage_normalization=opsd_advantage_normalization,
     )
 
     # --- Reward-split plots ---
@@ -1108,6 +1142,7 @@ def plot_teacher_group_adv_weight_lines(
             opsd_advantage_weighting_epsilon=opsd_advantage_weighting_epsilon,
             opsd_advantage_weighting_fn=opsd_advantage_weighting_fn,
             opsd_advantage_weighting_sign_mode=opsd_advantage_weighting_sign_mode,
+            opsd_advantage_normalization=opsd_advantage_normalization,
         )
         if not gpw:
             print(f"No OPSD advantage-weight data for student_reward={reward_val}, skipping {reward_tag} plot.")
@@ -1126,6 +1161,7 @@ def plot_teacher_group_adv_weight_lines(
             opsd_advantage_weighting_epsilon=opsd_advantage_weighting_epsilon,
             opsd_advantage_weighting_fn=opsd_advantage_weighting_fn,
             opsd_advantage_weighting_sign_mode=opsd_advantage_weighting_sign_mode,
+            opsd_advantage_normalization=opsd_advantage_normalization,
         )
 
 
@@ -1449,7 +1485,7 @@ def main():
     parser.add_argument(
         "--opsd-advantage-weighting-fn",
         choices=["sigmoid", "exp"],
-        default="sigmoid",
+        default="exp",
         help=(
             "Function used to map zscore(smoothed_delta) to token weight before clamp. "
             "'sigmoid' (default): 2*sigmoid(z). "
@@ -1476,9 +1512,19 @@ def main():
         ),
     )
     parser.add_argument(
+        "--opsd-advantage-normalization",
+        choices=["standard", "robust"],
+        default="robust",
+        help=(
+            "How to normalize smoothed teacher-student delta before mapping it to OPSD "
+            "advantage weight. 'standard': mean/std z-score (matches training). "
+            "'robust' (default): median/MAD normalization to reduce outlier bias in plots."
+        ),
+    )
+    parser.add_argument(
         "--opsd-signal-window-size",
         type=int,
-        default=128,
+        default=16,
         help=(
             "Window size for OPSD centered moving-average smoothing before z-score "
             "normalization when computing advantage weights from teacher-student token "
@@ -1538,6 +1584,7 @@ def main():
         opsd_advantage_weighting_epsilon=args.opsd_advantage_weighting_epsilon,
         opsd_advantage_weighting_fn=args.opsd_advantage_weighting_fn,
         opsd_advantage_weighting_sign_mode=args.opsd_advantage_weighting_sign_mode,
+        opsd_advantage_normalization=args.opsd_advantage_normalization,
     )
     plot_entropy_vs_teacher_minus_student(
         records,

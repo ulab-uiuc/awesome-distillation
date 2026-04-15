@@ -17,8 +17,8 @@
 #   - Teacher prompt: conciseness instruction + student_user_content  (vs. problem + reference solution)
 #   - Loss: reverse KL (KL(student || teacher))                       (vs. symmetric JSD)
 #   - No ground-truth answers required for training data
-#   - --opsd-use-ref-as-teacher + --ref-update-interval 50:
-#     implements Algorithm 1's periodic teacher refresh (θ̄ ← θ every M=50 steps)
+#   - --opsd-use-ref-as-teacher:
+#     strict fixed teacher (frozen to --ref-load checkpoint; no periodic refresh)
 #   - Rollout temperature: 1.0  (vs 1.2 in OPSD)
 #   - Max response length: 8192 (vs 1024 in OPSD)
 #
@@ -115,9 +115,8 @@ CKPT_ARGS=(
    --ref-load "/root/checkpoints_siqi/Qwen3-1.7B_torch_dist"
    --save /root/slime_siqi/output/Qwen3-1.7B_opsdc_slime/
    --save-interval 2000
-   # Paper Algorithm 1: teacher is synced with student every M=50 training steps.
-   # --ref-update-interval controls how often the "ref" weight backup is refreshed.
-   # Combined with --opsd-use-ref-as-teacher, this implements the periodic refresh.
+   # Strict fixed-teacher mode keeps the ref checkpoint frozen as teacher.
+   # --ref-update-interval must remain unset when using --opsd-use-ref-as-teacher.
    # --ref-update-interval 20
 )
 
@@ -193,12 +192,9 @@ GRPO_ARGS=(
    # 最终损失 = pg_loss + α·KL_teacher + β·KL_ref - ε·entropy
    # 若需恢复纯蒸馏模式（无 pg_loss），可重新加回 --opsd-pure-mode
 
-   # Paper Algorithm 1: θ̄ ← θ every M steps.
-   # --opsd-use-ref-as-teacher: teacher uses the "ref" weight backup (not live weights).
-   # --ref-update-interval 50:  refresh that backup every 50 rollout steps.
-   # Together these implement exactly the periodic teacher refresh from the paper.
-   # Without this flag, teacher = live student weights at every step (M=1 approx),
-   # which loses the stabilizing effect of a frozen teacher window.
+   # Strict fixed teacher: use the "ref" weight backup (not live weights).
+   # Without this flag, teacher = live student weights at every step.
+   # NOTE: --ref-update-interval is invalid in strict fixed-teacher mode.
    --opsd-use-ref-as-teacher
    --entropy-coef 0.00
 

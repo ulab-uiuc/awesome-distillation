@@ -252,6 +252,38 @@ def _strip_properly_formatted_commas(expr: str):
     return next_expr
 
 
+def _balance_latex_braces(expr: str) -> str:
+    """Repair obvious brace-count mismatches before tolerant LaTeX parsing.
+
+    Model answers occasionally contain a stray trailing ``}`` or a missing
+    closing brace in short LaTeX snippets such as ``\\frac{1}{2}}``.  The
+    downstream parser can recover from this, but it emits noisy tolerant-mode
+    logs for each sample.  We cheaply drop unmatched closing braces and append
+    any missing closing braces so common malformed answers still normalize.
+    """
+    if not expr or ("{" not in expr and "}" not in expr):
+        return expr
+
+    repaired = []
+    depth = 0
+    for ch in expr:
+        if ch == "{":
+            depth += 1
+            repaired.append(ch)
+        elif ch == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            repaired.append(ch)
+        else:
+            repaired.append(ch)
+
+    if depth > 0:
+        repaired.append("}" * depth)
+
+    return "".join(repaired)
+
+
 def _normalize(expr: str) -> str:
     """Normalize answer expressions."""
     if expr is None:
@@ -302,7 +334,7 @@ def _normalize(expr: str) -> str:
         expr = str(int(round(float(expr))))
     if "\\" in expr:
         try:
-            expr = _parse_latex(expr)
+            expr = _parse_latex(_balance_latex_braces(expr))
         except Exception:
             pass
 

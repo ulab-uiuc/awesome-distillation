@@ -117,7 +117,7 @@ ROLLOUT_ARGS=(
     --num-rollout 300
     --rollout-batch-size 32
     # Multiple samples per prompt give GRPO variance on binary safety rewards
-    --n-samples-per-prompt 1
+    --n-samples-per-prompt 4
     --rollout-max-response-len 2048
     --rollout-temperature 1.0
     --over-sampling-batch-size 32
@@ -174,17 +174,23 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
     --advantage-estimator grpo
-    --use-opd
-    --opd-type opsd
-    --opd-kl-coef 0.0
+    --use-kl-loss
+    --kl-loss-coef 0.00
+    --kl-loss-type low_var_kl
+    --entropy-coef 0.00
+    --eps-clip 0.2
+    --eps-clip-high 0.28
+    # --use-opd
+    # --opd-type opsd
+    # --opd-kl-coef 0.0
 
-    # pi mode: teacher = constitution + student_user_content
-    --opsd-teacher-info-mode pi
+    # # pi mode: teacher = constitution + student_user_content
+    # --opsd-teacher-info-mode pi
 
-    # Wiener KL distillation loss (same as OPSDC)
-    --opsd-loss-type reverse_kl
-    --opsd-jsd-coef 1.0
-    --opsd-pure-mode
+    # # Wiener KL distillation loss (same as OPSDC)
+    # --opsd-loss-type reverse_kl
+    # --opsd-jsd-coef 1.0
+    # --opsd-pure-mode
 
 
     # KL toward reference model for stability
@@ -195,8 +201,7 @@ GRPO_ARGS=(
     --entropy-coef 0.00
 
     # Strict fixed teacher from --ref-load checkpoint (no periodic refresh)
-    --opsd-use-ref-as-teacher
-    --entropy-coef 0.00
+    # --opsd-use-ref-as-teacher
 )
 
 ###############################################################################
@@ -220,7 +225,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
     --use-wandb
     --wandb-project slime-dev
-    --wandb-group qwen3-1.7B-pi-safety-train-wildguard_test-bullshit-reverse_kl
+    --wandb-group qwen3-1.7B-pi-safety-train-wildguard_test-bullshit_grpo_n4
     --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 

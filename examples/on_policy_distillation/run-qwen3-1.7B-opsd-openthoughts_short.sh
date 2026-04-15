@@ -76,14 +76,14 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --apply-chat-template-kwargs '{"enable_thinking":false}'
    --rollout-shuffle
-   --num-rollout 100
-   --rollout-batch-size 16
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --num-rollout 10000
+   --rollout-batch-size 128
+   --n-samples-per-prompt 1
+   --rollout-max-response-len 2048
    --rollout-temperature 1.0
-   --over-sampling-batch-size 16
+   --over-sampling-batch-size 128
 
-   --global-batch-size 16
+   --global-batch-size 128
    --balance-data
 )
 
@@ -100,7 +100,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 1
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -118,23 +118,25 @@ PERF_ARGS=(
 GRPO_ARGS=(
    --advantage-estimator grpo
 
-   # # OPSD setup: teacher forward for signal, but NO JSD loss
-   # --use-opd
-   # --opd-type opsd
-   # --opd-kl-coef 0.0
+   # OPSD setup: teacher forward for signal, but NO JSD loss
+   --use-opd
+   --opd-type opsd
+   --opd-kl-coef 0.0
 
-   # --opsd-teacher-info-mode full
+   --opsd-teacher-info-mode full
+   --opsd-pure-mode
+   --opsd-loss-type reverse_kl
 
-   # # No JSD distillation loss — signal is only used for pg_loss masking
-   # --opsd-jsd-coef 0.0
+   # No JSD distillation loss — signal is only used for pg_loss masking
+   --opsd-jsd-coef 1.0
 
-   # # OPSD advantage masking: the core new feature
+   # OPSD advantage masking: the core masking feature
    # --opsd-advantage-masking
    # --opsd-signal-window-size 32
 
-   # --opsd-teacher-think-max-tokens -1
+   --opsd-teacher-think-max-tokens -1
 
-   # --opsd-use-ref-as-teacher
+   --opsd-use-ref-as-teacher
    --entropy-coef 0.00
 
    --use-kl-loss
@@ -154,7 +156,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-opsd_masked_grpo-openthoughts-nothinking
+   --wandb-group qwen3-1.7B-opsd-reversekl_openthoughts_length2048_nothinking
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -167,6 +169,7 @@ MISC_ARGS=(
    --seed "${EXPERIMENT_SEED}"
    --attention-dropout 0.0
    --hidden-dropout 0.0
+   --use-fault-tolerance
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
@@ -179,8 +182,8 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=4,5,7,8
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export CUDA_VISIBLE_DEVICES=0,1,2
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 3 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 
 set +e
@@ -190,12 +193,12 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "4,5,7,8"
+        "CUDA_VISIBLE_DEVICES": "0,1,2"
      }
    }' \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 2 \
+   --actor-num-gpus-per-node 1 \
    --rollout-num-gpus 2 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \

@@ -76,14 +76,14 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --apply-chat-template-kwargs '{"enable_thinking":false}'
    --rollout-shuffle
-   --num-rollout 100
-   --rollout-batch-size 16
-   --n-samples-per-prompt 8
+   --num-rollout 10000
+   --rollout-batch-size 128
+   --n-samples-per-prompt 1
    --rollout-max-response-len 8192
    --rollout-temperature 1.0
-   --over-sampling-batch-size 16
+   --over-sampling-batch-size 128
 
-   --global-batch-size 16
+   --global-batch-size 128
    --balance-data
 )
 
@@ -100,7 +100,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 1
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -124,13 +124,15 @@ GRPO_ARGS=(
    --opd-kl-coef 0.0
 
    --opsd-teacher-info-mode full
+   --opsd-pure-mode
+   --opsd-loss-type reverse_kl
 
    # No JSD distillation loss — signal is only used for pg_loss masking
-   --opsd-jsd-coef 0.0
+   --opsd-jsd-coef 1.0
 
    # OPSD advantage masking: the core masking feature
-   --opsd-advantage-masking
-   --opsd-signal-window-size 32
+   # --opsd-advantage-masking
+   # --opsd-signal-window-size 32
 
    --opsd-teacher-think-max-tokens -1
 
@@ -154,7 +156,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-opsd_masked_grpo-openthoughts_nothinking
+   --wandb-group qwen3-1.7B-opsd-reversekl_openthoughts_nothinking
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -180,8 +182,8 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=1,2,3,6
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export CUDA_VISIBLE_DEVICES=4,5
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 2 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 
 set +e
@@ -191,13 +193,13 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "1,2,3,6"
+        "CUDA_VISIBLE_DEVICES": "4,5"
      }
    }' \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 2 \
-   --rollout-num-gpus 2 \
+   --actor-num-gpus-per-node 1 \
+   --rollout-num-gpus 1 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \

@@ -413,6 +413,109 @@ class MegatronTrainRayActor(TrainRayActor):
                 store_prefix=store_prefix,
             )
 
+    def _maybe_compute_opsd_grpo_reward_gap_means(self, rollout_data: RolloutBatch) -> None:
+        alpha = float(getattr(self.args, "opsd_grpo_r2_alpha", 0.0))
+        if (
+            alpha <= 0.0
+            or not mpu.is_pipeline_last_stage()
+            or not self.args.use_opd
+            or getattr(self.args, "opd_type", None) != "opsd"
+            or self.args.advantage_estimator != "grpo"
+        ):
+            return
+
+        teacher_tokens = rollout_data.get("teacher_tokens")
+        rollout_log_probs = rollout_data.get("rollout_log_probs")
+        loss_masks = rollout_data.get("loss_masks")
+        response_lengths = rollout_data.get("response_lengths")
+
+        if teacher_tokens is None:
+            raise ValueError("--opsd-grpo-r2-alpha requires teacher_tokens in rollout_data, but they are missing.")
+        if rollout_log_probs is None:
+            raise ValueError("--opsd-grpo-r2-alpha requires rollout_log_probs in rollout_data, but they are missing.")
+        if loss_masks is None or response_lengths is None:
+            raise ValueError("--opsd-grpo-r2-alpha requires loss_masks and response_lengths in rollout_data.")
+
+        teacher_total_lengths = [int(tokens.size(0)) for tokens in teacher_tokens]
+        teacher_rollout_data: RolloutBatch = {
+            "tokens": teacher_tokens,
+            "loss_masks": loss_masks,
+            "response_lengths": response_lengths,
+            "total_lengths": teacher_total_lengths,
+        }
+        if "dynamic_global_batch_size" in rollout_data:
+            teacher_rollout_data["dynamic_global_batch_size"] = rollout_data["dynamic_global_batch_size"]
+
+        if self.args.qkv_format == "bshd":
+            pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
+            teacher_max_seq_len = max(teacher_total_lengths)
+            teacher_max_seq_len = (teacher_max_seq_len + pad_size - 1) // pad_size * pad_size
+            teacher_rollout_data["max_seq_lens"] = [teacher_max_seq_len] * len(teacher_tokens)
+
+        teacher_iterator, teacher_num_microbatches = get_data_iterator(self.args, self.model, teacher_rollout_data)
+        teacher_tag = (
+            "ref"
+            if getattr(self.args, "opsd_use_ref_as_teacher", False)
+            else ("old_actor" if self.args.keep_old_actor else "actor")
+        )
+        if teacher_tag not in self.weights_backuper.backup_tags:
+            raise ValueError(
+                f"--opsd-grpo-r2-alpha requires teacher tag '{teacher_tag}' to exist in the weights backuper."
+            )
+
+        previous_tag = self._active_model_tag
+        previous_routing_stage = os.environ.get("ROUTING_REPLAY_STAGE")
+        try:
+            if self.args.use_routing_replay:
+                os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+            self._switch_model(teacher_tag)
+            teacher_outputs = self.compute_log_prob(
+                teacher_iterator,
+                teacher_num_microbatches,
+                store_prefix="opsd_reward_teacher_",
+            )
+        finally:
+            if previous_tag is not None and previous_tag in self.weights_backuper.backup_tags:
+                self._switch_model(previous_tag)
+            if previous_routing_stage is None:
+                os.environ.pop("ROUTING_REPLAY_STAGE", None)
+            else:
+                os.environ["ROUTING_REPLAY_STAGE"] = previous_routing_stage
+
+        teacher_log_probs = teacher_outputs.get("opsd_reward_teacher_log_probs")
+        if teacher_log_probs is None:
+            raise RuntimeError("--opsd-grpo-r2-alpha teacher pre-forward did not return teacher log probs.")
+        if len(teacher_log_probs) != len(rollout_log_probs):
+            raise ValueError(
+                "--opsd-grpo-r2-alpha teacher/rollout log prob count mismatch: "
+                f"{len(teacher_log_probs)} vs {len(rollout_log_probs)}."
+            )
+
+        gap_means: list[float] = []
+        for i, (teacher_lp, rollout_lp, loss_mask) in enumerate(
+            zip(teacher_log_probs, rollout_log_probs, loss_masks, strict=False)
+        ):
+            teacher_lp = teacher_lp.float()
+            rollout_lp = rollout_lp.to(device=teacher_lp.device, dtype=teacher_lp.dtype)
+            loss_mask = loss_mask.to(device=teacher_lp.device, dtype=teacher_lp.dtype)
+
+            if teacher_lp.shape != rollout_lp.shape:
+                raise ValueError(
+                    "--opsd-grpo-r2-alpha shape mismatch between teacher and rollout log probs at sample "
+                    f"{i}: {tuple(teacher_lp.shape)} vs {tuple(rollout_lp.shape)}."
+                )
+            if teacher_lp.shape != loss_mask.shape:
+                raise ValueError(
+                    "--opsd-grpo-r2-alpha shape mismatch between teacher log probs and loss mask at sample "
+                    f"{i}: {tuple(teacher_lp.shape)} vs {tuple(loss_mask.shape)}."
+                )
+
+            denom = loss_mask.sum().clamp(min=1.0)
+            gap_mean = ((teacher_lp - rollout_lp) * loss_mask).sum() / denom
+            gap_means.append(float(gap_mean.item()))
+
+        rollout_data["opsd_reward_gap_mean"] = gap_means
+
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
         if self.args.debug_rollout_only:
             return
@@ -491,6 +594,8 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     )
 
+                self._maybe_compute_opsd_grpo_reward_gap_means(rollout_data)
+
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                     if self.args.use_routing_replay:
@@ -559,6 +664,11 @@ class MegatronTrainRayActor(TrainRayActor):
             and (rollout_id + 1) % self.args.ref_update_interval == 0
             and "ref" in self.weights_backuper.backup_tags
         ):
+            if getattr(self.args, "opsd_use_ref_as_teacher", False):
+                raise ValueError(
+                    "--opsd-use-ref-as-teacher uses a strict fixed teacher and cannot be combined "
+                    "with --ref-update-interval."
+                )
             with timer("ref_model_update"):
                 if is_megatron_main_rank():
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")

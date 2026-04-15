@@ -1,25 +1,25 @@
 #!/bin/bash
 
-# OPD-SGLang answer_only: external 8B teacher with privileged answer hint
+# OPD-SGLang noanswer: external 8B teacher without privileged answer hint
 # Training dataset: BytedTsinghua-SIA/DAPO-Math-17k
 #
-# Teacher mode (OPD-SGLang): answer_only
+# Teacher mode (OPD-SGLang): same_as_student
 #   - Student: original problem, enable_thinking=False (no <think> in response)
-#   - Teacher: same student user message + answer-only hint (privileged information)
+#   - Teacher: same student prompt, no privileged answer hint
 #   - Distillation: reverse KL penalty via --opd-kl-coef
 #
 # Student and teacher both run with enable_thinking=false (chat template kwargs).
 # Teacher prompt is built in slime.rollout.on_policy_distillation.reward_func.
 #
 # Usage:
-#   bash examples/on_policy_distillation/run-qwen3-1.7B-8b-opd_answeronly-dapo.sh
-#   bash examples/on_policy_distillation/run-qwen3-1.7B-8b-opd_answeronly-dapo.sh \
+#   bash examples/on_policy_distillation/run-qwen3-1.7B-8b-opd_noanswer_dapo.sh
+#   bash examples/on_policy_distillation/run-qwen3-1.7B-8b-opd_noanswer_dapo.sh \
 #     --opd-kl-mode full_vocab_topk_reverse_kl --opd-topk 50
 
 OPD_KL_MODE="token_reverse_kl"
 OPD_TOPK="50"
 OPD_EXPLICIT_LOSS_COEF="1.0"
-OPD_DISTILL_MAX_RESPONSE_LEN="${OPD_DISTILL_MAX_RESPONSE_LEN:-2048}"
+OPD_DISTILL_MAX_RESPONSE_LEN="${OPD_DISTILL_MAX_RESPONSE_LEN:-8192}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -82,7 +82,7 @@ TEACHER_IP="172.22.224.251"
 TEACHER_PORT="${TEACHER_PORT:-30000}"
 TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-Qwen/Qwen3-8B}"
 TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-9}"
-TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.90}"
+TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.80}"
 RM_MAX_CONCURRENCY="${RM_MAX_CONCURRENCY:-8}"
 TEACHER_LOG_FILE="/tmp/sglang_teacher_qwen3_8b_$(date +%s).log"
 TEACHER_STARTED_BY_SCRIPT=0
@@ -189,6 +189,20 @@ CKPT_ARGS=(
 # - 只做原 OPD（adv 惩罚）：`opd-explicit-loss-coef = 0` 且 `opd-kl-coef > 0`
 # - 两者同时开：不是不行，但等于双重施压，通常需要重新调系数。
 # '''
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-128}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
+ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-8192}"
+ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-2048}"
+SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.78}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-256}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-256}"
+SGLANG_CHUNKED_PREFILL_SIZE="${SGLANG_CHUNKED_PREFILL_SIZE:-2048}"
+SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-1}"
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-256}"
+EVAL_CONFIG_PATH="${EVAL_CONFIG_PATH:-examples/on_policy_distillation/eval_config.yaml}"
+
 ROLLOUT_ARGS=(
    --prompt-data "$TRAIN_OUT"
    --input-key prompt
@@ -197,13 +211,14 @@ ROLLOUT_ARGS=(
    --apply-chat-template-kwargs '{"enable_thinking":false}'
    --rollout-shuffle
    --num-rollout 300
-   --rollout-batch-size 128
+   --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
    --n-samples-per-prompt 1
-   --rollout-max-response-len 4096
+   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
    --rollout-temperature 1.0
-   --over-sampling-batch-size 128
+   --rollout-top-p "${ROLLOUT_TOP_P}"
+   --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE}"
 
-   --global-batch-size 64
+   --global-batch-size "${GLOBAL_BATCH_SIZE}"
    --balance-data
 )
 
@@ -218,7 +233,7 @@ RM_ARGS=(
 
 EVAL_ARGS=(
     --eval-interval 10
-    --eval-config examples/on_policy_distillation/eval_config.yaml
+    --eval-config "${EVAL_CONFIG_PATH}"
     --log-passrate
     # --skip-eval-before-train
 )
@@ -236,7 +251,7 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 4096
+   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
 )
 
 GRPO_ARGS=(
@@ -273,8 +288,15 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.9}"
+   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
+   --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}"
+   --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
+   --sglang-chunked-prefill-size "${SGLANG_CHUNKED_PREFILL_SIZE}"
 )
+
+if [[ "${SGLANG_DISABLE_CUDA_GRAPH}" == "1" ]]; then
+   SGLANG_ARGS+=(--sglang-disable-cuda-graph)
+fi
 
 MISC_ARGS=(
    --attention-dropout 0.0
@@ -282,7 +304,7 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
-   --log-probs-chunk-size 512
+   --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE}"
 )
 
 
@@ -291,7 +313,7 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=6,7,8
+export CUDA_VISIBLE_DEVICES=3,4,5
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 3 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 set +e
@@ -301,7 +323,7 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "6,7,8"
+        "CUDA_VISIBLE_DEVICES": "3,4,5"
      }
    }' \
    -- python3 train.py \

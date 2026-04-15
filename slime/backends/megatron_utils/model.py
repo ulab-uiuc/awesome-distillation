@@ -713,6 +713,26 @@ def train_one_step(
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
+    # In strict fixed-teacher OPSD mode, keep the "actor" backup in sync with the
+    # live actor weights at each train step. This ensures the ref→teacher swap in
+    # _prefetch_opsd_teacher_logits restores the current actor instead of a stale
+    # rollout-end snapshot.
+    if (
+        args.use_opd
+        and args.opd_type == "opsd"
+        and getattr(args, "opsd_use_ref_as_teacher", False)
+        and getattr(model[0], "role", "actor") == "actor"
+    ):
+        if _opsd_weights_backuper is None:
+            raise RuntimeError(
+                "--opsd-use-ref-as-teacher is enabled, but OPSD weights backuper is not initialized."
+            )
+        if "actor" not in _opsd_weights_backuper.backup_tags:
+            raise RuntimeError(
+                "--opsd-use-ref-as-teacher requires an actor backup tag in OPSD weights backuper."
+            )
+        _opsd_weights_backuper.backup("actor")
+
     def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[
         torch.Tensor,
         Callable[[torch.Tensor], tuple[torch.Tensor, int, dict[str, torch.Tensor | list[str]]]],

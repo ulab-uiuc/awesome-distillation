@@ -107,10 +107,10 @@ CKPT_ARGS=(
    --ref-load "/root/Qwen3-8B_torch_dist"
    --save /root/slime_siqi/output/Qwen3-8B_opsd_full_slime/
    --save-interval 2000
-   # Paper Algorithm 1: teacher weights refreshed every M steps.
-   # --opsd-use-ref-as-teacher uses the "ref" backup as frozen teacher.
-   # --ref-update-interval 20:  sync backup every 20 rollout steps.
-   --ref-update-interval 20
+   # Strict fixed-teacher mode: --opsd-use-ref-as-teacher freezes teacher to
+   # the initial --ref-load checkpoint for the whole run.
+   # NOTE: --ref-update-interval is invalid with strict fixed teacher.
+   # --ref-update-interval 20
 )
 
 ROLLOUT_ARGS=(
@@ -189,8 +189,8 @@ GRPO_ARGS=(
    # No --opsd-pure-mode: pg_loss is active alongside both KL terms.
    # Remove this comment and add --opsd-pure-mode to revert to distillation-only.
 
-   # Frozen teacher: use ref model backup instead of live student weights.
-   # Provides a stable distillation target (Algorithm 1 of arXiv 2601.18734).
+   # Strict fixed teacher: use ref model backup instead of live student weights.
+   # The teacher stays frozen for the whole run (no periodic refresh).
    --opsd-use-ref-as-teacher
    --entropy-coef 0.00
 
