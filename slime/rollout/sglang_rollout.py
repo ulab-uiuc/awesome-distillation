@@ -36,6 +36,68 @@ __all__ = ["generate_rollout"]
 logger = logging.getLogger(__name__)
 
 
+def _truncate_log_text(value: Any, limit: int = 600) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...<truncated {len(text) - limit} chars>"
+
+
+def _summarize_reward_for_log(reward: Any) -> Any:
+    if not isinstance(reward, dict):
+        return reward
+
+    summary: dict[str, Any] = {}
+    for key in ("accuracy", "accuracy_strict", "accuracy_relaxed", "teacher_input_len", "teacher_response_start"):
+        if key in reward:
+            summary[key] = reward[key]
+
+    teacher_topk = reward.get("teacher_topk_log_probs")
+    if teacher_topk is not None:
+        summary["teacher_topk_log_probs_len"] = len(teacher_topk)
+
+    teacher_topk_ids = reward.get("teacher_topk_token_ids")
+    if teacher_topk_ids is not None:
+        summary["teacher_topk_token_ids_len"] = len(teacher_topk_ids)
+
+    teacher_output = reward.get("teacher_output")
+    if isinstance(teacher_output, dict):
+        meta_info = teacher_output.get("meta_info", {}) if isinstance(teacher_output.get("meta_info"), dict) else {}
+        teacher_output_summary: dict[str, Any] = {
+            "text_len": len(teacher_output.get("text", "") or ""),
+            "output_ids_len": len(teacher_output.get("output_ids", []) or []),
+            "meta_info_keys": sorted(meta_info.keys())[:20],
+        }
+        for key in (
+            "prompt_tokens",
+            "completion_tokens",
+            "cached_tokens",
+            "weight_version",
+        ):
+            if key in meta_info:
+                teacher_output_summary[key] = meta_info[key]
+        for key in (
+            "input_token_logprobs",
+            "output_token_logprobs",
+            "token_ids_logprob",
+            "input_top_logprobs",
+            "input_token_top_logprobs",
+        ):
+            value = meta_info.get(key)
+            if isinstance(value, list):
+                teacher_output_summary[f"{key}_len"] = len(value)
+        summary["teacher_output"] = teacher_output_summary
+
+    return summary or sorted(reward.keys())
+
+
+def _summarize_sample_for_log(sample: Sample) -> str:
+    prompt_and_response = _truncate_log_text(str(sample.prompt) + sample.response, limit=800)
+    label = _truncate_log_text(sample.label or "", limit=120)
+    reward = _summarize_reward_for_log(sample.reward)
+    return f"prompt+response={prompt_and_response}, label={label}, reward={reward}"
+
+
 def _should_use_custom_rm(args: Namespace, sample: Sample, evaluation: bool) -> bool:
     # During eval, allow dataset rm_type to bypass custom RM (e.g., OPD teacher calls).
     if not evaluation or args.custom_rm_path is None:
@@ -109,6 +171,23 @@ def _parse_top_logprobs_entry(raw_entry: Any, topk: int) -> tuple[list[int], lis
     token_ids = [p[0] for p in selected]
     logps = [p[1] for p in selected]
     return token_ids, logps
+
+
+def _get_output_top_logprobs_entry(meta_info: dict[str, Any], output_item: Any, position: int) -> Any:
+    if isinstance(output_item, dict):
+        for key in ("top_logprobs", "top_logprob", "logprobs"):
+            if output_item.get(key) is not None:
+                return output_item[key]
+    elif isinstance(output_item, (list, tuple)) and len(output_item) >= 3 and output_item[2] is not None:
+        return output_item[2]
+
+    if not isinstance(meta_info, dict):
+        return None
+    for key in ("output_top_logprobs", "output_token_top_logprobs", "top_logprobs"):
+        sidecar = meta_info.get(key)
+        if isinstance(sidecar, (list, tuple)) and position < len(sidecar) and sidecar[position] is not None:
+            return sidecar[position]
+    return None
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -217,12 +296,16 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
-    if (
-        args.use_opd
-        and getattr(args, "opd_type", None) == "sglang"
-        and getattr(args, "opd_kl_mode", "token_reverse_kl") == "full_vocab_topk_reverse_kl"
-    ):
-        payload["top_logprobs_num"] = int(getattr(args, "opd_topk", 50))
+    use_opd_sglang = args.use_opd and getattr(args, "opd_type", None) == "sglang"
+    use_topk_kl = use_opd_sglang and getattr(args, "opd_kl_mode", "token_reverse_kl") == "full_vocab_topk_reverse_kl"
+    diag_enabled = use_opd_sglang and getattr(args, "opd_token_stats", False)
+    requested_topk = []
+    if use_topk_kl:
+        requested_topk.append(int(getattr(args, "opd_topk", 50)))
+    if diag_enabled:
+        requested_topk.append(int(getattr(args, "opd_token_stats_topk", 50)))
+    if requested_topk:
+        payload["top_logprobs_num"] = max(requested_topk)
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
@@ -257,28 +340,38 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         else:
             new_response_tokens, new_response_log_probs = [], []
 
-        if (
-            args.use_opd
-            and getattr(args, "opd_type", None) == "sglang"
-            and getattr(args, "opd_kl_mode", "token_reverse_kl") == "full_vocab_topk_reverse_kl"
-        ):
+        if use_topk_kl or diag_enabled:
             if "output_token_logprobs" not in output["meta_info"]:
                 raise ValueError(
-                    "OPD full_vocab_topk_reverse_kl requires `meta_info.output_token_logprobs`, but it is missing."
+                    "OPD token diagnostics require `meta_info.output_token_logprobs`, but it is missing."
                 )
-            topk = int(getattr(args, "opd_topk", 50))
-            if sample.opd_topk_token_ids is None:
+            topk_for_kl = int(getattr(args, "opd_topk", 50))
+            topk_for_diag = int(getattr(args, "opd_token_stats_topk", 50))
+            if use_topk_kl and sample.opd_topk_token_ids is None:
                 sample.opd_topk_token_ids = []
-            if sample.opd_topk_student_log_probs is None:
+            if use_topk_kl and sample.opd_topk_student_log_probs is None:
                 sample.opd_topk_student_log_probs = []
+            if diag_enabled and sample.opd_diag_student_topk_token_ids is None:
+                sample.opd_diag_student_topk_token_ids = []
             for pos, item in enumerate(output["meta_info"]["output_token_logprobs"]):
-                if not isinstance(item, (list, tuple)) or len(item) < 3:
+                max_topk = max(payload["top_logprobs_num"], 1)
+                top_logprobs_entry = _get_output_top_logprobs_entry(output["meta_info"], item, pos)
+                if top_logprobs_entry is None:
+                    available_sidecars = [
+                        key
+                        for key in ("output_top_logprobs", "output_token_top_logprobs", "top_logprobs")
+                        if output["meta_info"].get(key) is not None
+                    ]
                     raise ValueError(
-                        "OPD full_vocab_topk_reverse_kl requires top_logprobs in output_token_logprobs entries."
+                        "OPD token diagnostics require top_logprobs for each generated token, "
+                        f"but none were found at position {pos}. available_sidecars={available_sidecars}"
                     )
-                top_token_ids, top_logps = _parse_top_logprobs_entry(item[2], topk)
-                sample.opd_topk_token_ids.append(top_token_ids)
-                sample.opd_topk_student_log_probs.append(top_logps)
+                top_token_ids, top_logps = _parse_top_logprobs_entry(top_logprobs_entry, max_topk)
+                if use_topk_kl:
+                    sample.opd_topk_token_ids.append(top_token_ids[:topk_for_kl])
+                    sample.opd_topk_student_log_probs.append(top_logps[:topk_for_kl])
+                if diag_enabled:
+                    sample.opd_diag_student_topk_token_ids.append(top_token_ids[:topk_for_diag])
 
         # Update sample with tokens directly - avoiding re-tokenization
         sample.tokens = sample.tokens + new_response_tokens
@@ -516,9 +609,7 @@ async def generate_rollout_async(
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
-                logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
-                )
+                logger.info("First rollout sample: %s", _summarize_sample_for_log(sample))
                 do_print = False
 
             assert len(group) == args.n_samples_per_prompt
@@ -537,9 +628,7 @@ async def generate_rollout_async(
 
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
-    logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
-    )
+    logger.info("Finish rollout: %s", _summarize_sample_for_log(sample))
 
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)

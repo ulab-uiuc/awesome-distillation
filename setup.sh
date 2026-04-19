@@ -126,7 +126,9 @@ CUDA_VISIBLE_DEVICES=0,1 python3 -m sglang.launch_server --model-path /root/chec
 
 CUDA_VISIBLE_DEVICES=4,6 python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --port 30002 --host 0.0.0.0 --tp 1
 CUDA_VISIBLE_DEVICES=0,1 python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --port 30002 --host 0.0.0.0 --tp 1
-CUDA_VISIBLE_DEVICES=2 python3 -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30000 --host 0.0.0.0 --tp 1
+CUDA_VISIBLE_DEVICES=1 python3 -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30001 --host 0.0.0.0 --tp 1
+
+CUDA_VISIBLE_DEVICES=3,4 python3 -m sglang.launch_server --model-path Qwen/Qwen3-1.7B-step29 --port 30002 --host 0.0.0.0 --tp 2
 
 
 CUDA_VISIBLE_DEVICES=5 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-1.7B --port 30002 --host 0.0.0.0 --tp 1
@@ -184,3 +186,19 @@ python examples/on_policy_distillation/plot_token_winner_interactive.py \
 
 
 ps -o pid,ppid,user,tty,lstart,cmd -p 314845
+
+
+CUDA_VISIBLE_DEVICES=1 python3 -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30000 --host 0.0.0.0 --tp 1  --mem-fraction-static  0.8   --watchdog-timeout 3600
+
+
+cd /root/slime_siqi                                                                                                       
+                                                                                                                            
+python3 tools/convert_fsdp_to_hf.py \
+  --input-dir /root/slime_siqi/output/Qwen3-1.7B_8B_opd_noanswer_dapo/iter_0000029 \
+  --output-dir /root/checkpoints_siqi/Qwen3-1.7B_step29 \
+  --origin-hf-dir /root/checkpoints_siqi/Qwen3-1.7B
+
+
+CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path output/Qwen3-1.7B_opsd_masked_grpo_dapo_hf --port 30002 --host 0.0.0.0 --tp 1
+
+

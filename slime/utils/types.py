@@ -34,6 +34,10 @@ class Sample:
     opd_topk_token_ids: list[list[int]] | None = None
     opd_topk_student_log_probs: list[list[float]] | None = None
     opd_topk_teacher_log_probs: list[list[float]] | None = None
+    # Optional OPD/OPSD token-diagnostic payloads.
+    opd_diag_student_topk_token_ids: list[list[int]] | None = None
+    opd_diag_topk_overlap: list[float] | None = None
+    opd_diag_teacher_rank_at_k: list[float] | None = None
     teacher_tokens: list[int] | None = None  # Full token sequence for OPSD teacher (privileged prompt + student response)
     teacher_prompt_length: int | None = None  # Length of the privileged prompt in teacher_tokens (for OPSD)
 

@@ -589,6 +589,11 @@ class RolloutManager:
             train_data["opd_topk_student_log_probs"] = [sample.opd_topk_student_log_probs for sample in samples]
         if getattr(samples[0], "opd_topk_teacher_log_probs", None) is not None:
             train_data["opd_topk_teacher_log_probs"] = [sample.opd_topk_teacher_log_probs for sample in samples]
+        if getattr(samples[0], "opd_diag_topk_overlap", None) is not None:
+            train_data["opd_diag_topk_overlap"] = [sample.opd_diag_topk_overlap for sample in samples]
+        if getattr(samples[0], "opd_diag_teacher_rank_at_k", None) is not None:
+            train_data["opd_diag_teacher_rank_at_k"] = [sample.opd_diag_teacher_rank_at_k for sample in samples]
+
 
         # OPSD: pack teacher tokens and teacher prompt lengths
         if getattr(samples[0], "teacher_tokens", None) is not None:
@@ -642,6 +647,9 @@ class RolloutManager:
                 "opd_topk_token_ids",
                 "opd_topk_student_log_probs",
                 "opd_topk_teacher_log_probs",
+                "opd_diag_topk_overlap",
+                "opd_diag_teacher_rank_at_k",
+
                 "teacher_tokens",
                 "teacher_prompt_lengths",
             ]:

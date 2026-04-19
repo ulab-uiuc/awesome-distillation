@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
+from slime.utils.opd_token_stats import build_token_repetition_mask, compute_token_stats_metrics
 from slime.utils.opsd_grpo_reward import recompute_local_opsd_grpo_r2_rewards
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
@@ -788,6 +789,112 @@ def _compute_opsd_center_and_scale(
     return center, scale.clamp(min=1e-8)
 
 
+def _build_repetition_mask_list(
+    args: Namespace,
+    batch: RolloutBatch,
+    *,
+    total_lengths: list[int],
+    response_lengths: list[int],
+    max_seq_lens: list[int] | None,
+) -> list[torch.Tensor]:
+    ngram = int(getattr(args, "opd_token_stats_repeat_ngram", 3))
+    repetition_masks: list[torch.Tensor] = []
+    for i, (tokens_i, total_length, response_length) in enumerate(
+        zip(batch["unconcat_tokens"], total_lengths, response_lengths, strict=False)
+    ):
+        response_tokens_i = tokens_i[-response_length:] if response_length > 0 else tokens_i[0:0]
+        repeat_mask_full = build_token_repetition_mask(response_tokens_i, ngram=ngram)
+        repeat_mask_local = slice_log_prob_with_cp(
+            repeat_mask_full,
+            total_length,
+            response_length,
+            args.qkv_format,
+            max_seq_lens[i] if args.qkv_format == "bshd" else None,
+        )
+        repetition_masks.append(
+            torch.tensor(repeat_mask_local, dtype=torch.float32, device=torch.cuda.current_device())
+        )
+    return repetition_masks
+
+
+
+
+def _maybe_collect_opd_token_stats_metrics(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    *,
+    log_probs_list: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    max_seq_lens: list[int] | None,
+    opd_distill_sample_mask: list[float] | None,
+) -> dict[str, torch.Tensor]:
+    if not (args.use_opd and getattr(args, "opd_token_stats", False)):
+        return {}
+    if getattr(args, "opd_type", None) not in {"sglang", "opsd"}:
+        return {}
+
+    if getattr(args, "opd_type", None) == "opsd":
+        teacher_log_probs_list = batch.get("opsd_teacher_sampled_log_probs")
+    else:
+        teacher_log_probs_list = batch.get("teacher_log_probs")
+
+    topk_overlap_list = batch.get("opd_diag_topk_overlap")
+    teacher_rank_list = batch.get("opd_diag_teacher_rank_at_k")
+    if teacher_log_probs_list is None:
+        raise ValueError("OPD token diagnostics require teacher sampled-token logprobs in batch.")
+    if topk_overlap_list is None or teacher_rank_list is None:
+        raise ValueError(
+            "OPD token diagnostics require opd_diag_topk_overlap and opd_diag_teacher_rank_at_k in batch."
+        )
+
+    repetition_mask_list = _build_repetition_mask_list(
+        args,
+        batch,
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        max_seq_lens=max_seq_lens,
+    )
+
+    teacher_logprob_mask = batch.get("teacher_logprob_mask")
+    effective_masks: list[torch.Tensor] = []
+    valid_masks: list[torch.Tensor] = []
+    for i, loss_mask_i in enumerate(batch["loss_masks"]):
+        effective_mask_i = loss_mask_i.to(device=log_probs_list[i].device, dtype=torch.float32)
+        valid_mask_i = effective_mask_i.clone()
+        if teacher_logprob_mask is not None:
+            valid_mask_i = valid_mask_i * teacher_logprob_mask[i].to(device=valid_mask_i.device, dtype=torch.float32)
+        if (
+            getattr(args, "opd_type", None) == "sglang"
+            and opd_distill_sample_mask is not None
+            and opd_distill_sample_mask[i] <= 0
+        ):
+            valid_mask_i = torch.zeros_like(valid_mask_i)
+        effective_masks.append(effective_mask_i)
+        valid_masks.append(valid_mask_i)
+
+    metrics = compute_token_stats_metrics(
+        repeat_mask=torch.cat(repetition_mask_list, dim=0),
+        effective_mask=torch.cat(effective_masks, dim=0),
+        valid_mask=torch.cat(valid_masks, dim=0),
+        student_log_probs=torch.cat(log_probs_list, dim=0).detach(),
+        teacher_log_probs=torch.cat(
+            [tensor.to(device=log_probs_list[i].device, dtype=torch.float32) for i, tensor in enumerate(teacher_log_probs_list)],
+            dim=0,
+        ).detach(),
+        teacher_rank_at_k=torch.cat(
+            [tensor.to(device=log_probs_list[i].device, dtype=torch.float32) for i, tensor in enumerate(teacher_rank_list)],
+            dim=0,
+        ).detach(),
+        topk_overlap=torch.cat(
+            [tensor.to(device=log_probs_list[i].device, dtype=torch.float32) for i, tensor in enumerate(topk_overlap_list)],
+            dim=0,
+        ).detach(),
+    )
+    return {f"opd_token_stats_{key}": value.detach() for key, value in metrics.items()}
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1342,6 +1449,18 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
+    reported_loss.update(
+        _maybe_collect_opd_token_stats_metrics(
+            args,
+            batch,
+            logits,
+            log_probs_list=log_probs_list,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            max_seq_lens=max_seq_lens,
+            opd_distill_sample_mask=opd_distill_sample_mask,
+        )
+    )
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()

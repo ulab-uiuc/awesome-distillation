@@ -32,32 +32,35 @@ OpenAI-compatible chat completions API.
 
 
 python examples/on_policy_distillation/eval_student_teacher_inference.py \
-    --model /root/checkpoints_siqi/Qwen3-1.7B \
+    --model /root/checkpoints_siqi/Qwen3-1.7B_step29 \
     --student-api-base http://0.0.0.0:30002/v1 \
-    --teacher-model Qwen/Qwen3-8B Qwen/Qwen3-8B Qwen/Qwen3-8B Qwen/Qwen3-1.7B /root/checkpoints_siqi/Qwen3-1.7B \
-    --teacher-api-base http://0.0.0.0:30001/v1 http://0.0.0.0:30001/v1 http://0.0.0.0:30001/v1 http://0.0.0.0:30002/v1 http://0.0.0.0:30002/v1 \
-    --teacher-info-mode full answer_only same_as_student full answer_only \
-    --dataset ./train_openthoughts_math.jsonl \
-    --max-new-tokens 16384 \
-    --n-samples 256 \
+    --teacher-model Qwen/Qwen3-8B \
+    --teacher-api-base http://0.0.0.0:30001/v1  \
+    --teacher-info-mode same_as_student \
+    --dataset /root/math/data/train_dapo.jsonl \
+    --max-new-tokens 8192 \
+    --n-samples 32 \
     --concurrency 16 \
     --seed 42 \
     --score-concurrency 1 \
     --score-chunk-tokens 256 \
     --student-enable-thinking false \
-    --output ./eval_openthoughts_student_teacher_inference_all_nothinking_b256.jsonl
-
+    --output ./eval_dapo_student_step29_teacher_inference_all_qwen3-1.7b_8192_b32.jsonl \
+    --record-student-token-entropy true \
+    --student-token-entropy-mode strict_exact \
+    --debug-print-first-student-meta-info false \
+    --student-token-entropy-topk 50
 
 
     
 python examples/on_policy_distillation/eval_student_teacher_inference.py \
-    --model Qwen/Qwen3-8B \
+    --model Qwen/Qwen3-1.7B_step29 \
     --student-api-base http://0.0.0.0:30001/v1 \
-    --teacher-model Qwen/Qwen3-8B Qwen/Qwen3-8B \
-    --teacher-api-base http://0.0.0.0:30001/v1 http://0.0.0.0:30001/v1 \
+    --teacher-model Qwen/Qwen3-8B  \
+    --teacher-api-base http://172.22.224.251:30001/v1 \
     --teacher-info-mode full answer_only \
     --dataset ./train_openthoughts_math.jsonl \
-    --max-new-tokens 16384 \
+    --max-new-tokens 8192 \
     --n-samples 128 \
     --concurrency 16 \
     --seed 42 \
@@ -73,20 +76,20 @@ python examples/on_policy_distillation/eval_student_teacher_inference.py \
 
 
 python examples/on_policy_distillation/eval_student_teacher_inference.py \
-    --model Qwen/Qwen3-1.7B \
+    --model Qwen/Qwen3-1.7B_step29 \
     --student-api-base http://0.0.0.0:30002/v1 \
     --teacher-model Qwen/Qwen3-8B Qwen/Qwen3-8B \
-    --teacher-api-base http://0.0.0.0:30001/v1 \
+    --teacher-api-base http://172.22.224.251:30001/v1 \
     --teacher-info-mode full \
     --dataset ./train_openthoughts_math.jsonl \
-    --max-new-tokens 16384 \
+    --max-new-tokens 8192 \
     --n-samples 128 \
     --concurrency 16 \
     --seed 42 \
     --score-concurrency 4 \
     --score-chunk-tokens 256 \
     --student-enable-thinking false \
-    --output ./eval_openthoughts_student1.7b_teacher8b_inference_all_nothinking_entropy_b128.jsonl \
+    --output ./eval_dapo_student1.7b_teacher8b_inference_all_nothinking_entropy_b128.jsonl \
     --record-student-token-entropy true \
     --student-token-entropy-mode auto \
     --debug-print-first-student-meta-info false \
@@ -256,6 +259,8 @@ import math
 import os
 import random
 import re
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -526,6 +531,70 @@ def _normalize_base_url(base_url: str) -> str:
 
 def _to_generate_url(base_url: str) -> str:
     return f"{_normalize_base_url(base_url)}/generate"
+
+
+def _to_model_info_url(base_url: str) -> str:
+    return f"{_normalize_base_url(base_url)}/get_model_info"
+
+
+def _fetch_server_model_info(base_url: str, timeout_sec: float = 5.0) -> dict[str, Any] | None:
+    url = _to_model_info_url(base_url)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_sec) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as e:
+        logger.warning("Failed to query server model info from %s: %s", url, e)
+        return None
+    except Exception as e:
+        logger.warning("Unexpected error when querying server model info from %s: %s", url, e)
+        return None
+
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        logger.warning("Server model info from %s is not valid JSON: %r", url, body[:400])
+        return None
+    return data if isinstance(data, dict) else {"raw": data}
+
+
+def _model_source_aliases(model_source: str) -> list[str]:
+    raw = (model_source or "").strip()
+    if not raw:
+        return []
+    aliases = {
+        raw.lower(),
+        os.path.basename(raw).lower(),
+        raw.split("/")[-1].lower(),
+    }
+    expanded = set()
+    for alias in aliases:
+        if not alias:
+            continue
+        expanded.add(alias)
+        expanded.add(alias.replace("_", "-"))
+        expanded.add(alias.replace("-", "_"))
+    return sorted(a for a in expanded if len(a) >= 6)
+
+
+def _log_server_model_info_and_check(role: str, model_source: str, base_url: str) -> dict[str, Any] | None:
+    info = _fetch_server_model_info(base_url)
+    if info is None:
+        return None
+
+    info_text = json.dumps(info, ensure_ascii=False, sort_keys=True)
+    logger.info("%s server /get_model_info @ %s: %s", role, _normalize_base_url(base_url), info_text[:2000])
+
+    aliases = _model_source_aliases(model_source)
+    info_text_lower = info_text.lower()
+    if aliases and not any(alias in info_text_lower for alias in aliases):
+        logger.warning(
+            "%s local model/tokenizer source %r may not match the server model info above. "
+            "This script sends `input_ids` to /generate, so a tokenizer/server mismatch can produce "
+            "garbled outputs and near-zero accuracy.",
+            role,
+            model_source,
+        )
+    return info
 
 
 def _is_probable_oom_error(exc: Exception) -> bool:
@@ -1790,6 +1859,16 @@ def _count_zero_logprobs(values: list[float], atol: float = 1e-12) -> tuple[int,
 def run_eval(args):
     samples = load_dataset(args.dataset, args.n_samples, args.seed)
 
+    _log_server_model_info_and_check("Student", args.model, args.student_api_base)
+    for tc in args.teacher_configs:
+        if tc["mode"] == "none":
+            continue
+        _log_server_model_info_and_check(
+            f"Teacher[{tc['index']}]",
+            tc["model"],
+            tc["api_base"],
+        )
+
     student_scoring_tokenizer = _load_tokenizer(args.model)
 
     # Pre-load scoring and prompt tokenizers per teacher config, cached by model name.
@@ -2008,6 +2087,8 @@ def run_eval(args):
     n = len(student_rewards)
     student_acc = sum(student_rewards) / n if n else 0.0
     student_zero_ratio = (student_zero_count / student_finite_count) if student_finite_count > 0 else None
+    boxed_count = sum(1 for resp in student_responses if "\\boxed{" in (resp or ""))
+    answer_count = sum(1 for resp in student_responses if re.search(r"(?im)^\\s*answer\\s*[:：]", resp or ""))
 
     if student_zero_ratio is not None:
         logger.info(
@@ -2020,6 +2101,15 @@ def run_eval(args):
                 "This may indicate post-temperature/sampled logprobs rather than original model logprobs.",
                 student_zero_ratio * 100.0,
             )
+    if n > 0 and student_acc == 0.0 and boxed_count == 0 and answer_count == 0:
+        logger.warning(
+            "Student accuracy is 0 and none of the %d responses contain a final-answer marker "
+            "(no \\boxed{} and no 'Answer:' line). This usually means either "
+            "(1) the student prompt/output format does not match the dataset grading format, or "
+            "(2) the tokenizer used to build input_ids does not match the model actually served at %s.",
+            n,
+            _normalize_base_url(args.student_api_base),
+        )
 
     print(f"\n{'=' * 60}")
     print(f"Dataset : {args.dataset}")

@@ -1071,6 +1071,44 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--opd-token-stats",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable token-level OPD/OPSD diagnostics for W&B logging. "
+                    "When enabled, we track token 3-gram repetition ratio, "
+                    "teacher/student sampled-token logprob gaps, teacher rank@K, "
+                    "top-k overlap, and EOS probabilities on response tokens."
+                ),
+            )
+            parser.add_argument(
+                "--opd-token-stats-topk",
+                type=int,
+                default=50,
+                help=(
+                    "Top-k used by --opd-token-stats for teacher rank@K and top-k overlap. "
+                    "Default is 50."
+                ),
+            )
+            parser.add_argument(
+                "--opd-token-stats-repeat-ngram",
+                type=int,
+                default=3,
+                help=(
+                    "N-gram length used to define repeated response tokens for --opd-token-stats. "
+                    "Default is 3."
+                ),
+            )
+            parser.add_argument(
+                "--opd-token-stats-eos-token-id",
+                type=int,
+                default=-1,
+                help=(
+                    "[DEPRECATED] This argument is no longer used. EOS logprob tracking has been removed. "
+                    "Kept for backward compatibility with existing launch scripts."
+                ),
+            )
+            parser.add_argument(
                 "--opd-zero-task-reward",
                 action="store_true",
                 default=False,
@@ -2034,6 +2072,10 @@ def slime_validate_args(args):
         and getattr(args, "opd_distill_max_response_len", -1) <= 0
     ):
         raise ValueError("--opd-distill-max-response-len must be -1 or a positive integer.")
+    if getattr(args, "opd_token_stats_topk", 0) <= 0:
+        raise ValueError("--opd-token-stats-topk must be > 0.")
+    if getattr(args, "opd_token_stats_repeat_ngram", 0) < 2:
+        raise ValueError("--opd-token-stats-repeat-ngram must be >= 2.")
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):
@@ -2050,9 +2092,12 @@ def slime_validate_args(args):
         if args.opd_type is None:
             raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
 
+
         if args.opd_type == "megatron":
             if getattr(args, "opd_kl_mode", "token_reverse_kl") != "token_reverse_kl":
                 raise ValueError("--opd-kl-mode only supports --opd-type=sglang.")
+            if getattr(args, "opd_token_stats", False):
+                raise ValueError("--opd-token-stats currently supports only --opd-type=sglang or --opd-type=opsd.")
             if args.opd_teacher_load is None:
                 raise ValueError(
                     "--opd-teacher-load is required when --opd-type=megatron. "
@@ -2108,6 +2153,8 @@ def slime_validate_args(args):
             raise ValueError("--opd-kl-mode is set but --use-opd is not enabled.")
         if getattr(args, "opd_explicit_loss_coef", 0.0) > 0:
             raise ValueError("--opd-explicit-loss-coef is set but --use-opd is not enabled.")
+        if getattr(args, "opd_token_stats", False):
+            raise ValueError("--opd-token-stats is set but --use-opd is not enabled.")
 
     if getattr(args, "opd_explicit_loss_coef", 0.0) > 0 and getattr(args, "opd_type", None) != "sglang":
         raise ValueError("--opd-explicit-loss-coef currently only supports --opd-type=sglang.")

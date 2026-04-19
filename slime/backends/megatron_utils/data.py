@@ -426,6 +426,9 @@ def log_rollout_data(
                 # OPD top-k index payload
                 "opd_topk_token_ids",
                 "teacher_logprob_mask",
+                # OPD/OPSD token-diagnostic payloads are train-only.
+                "opd_diag_topk_overlap",
+                "opd_diag_teacher_rank_at_k",
             ]:
                 continue
             # Upload per sample mean for each rollout value

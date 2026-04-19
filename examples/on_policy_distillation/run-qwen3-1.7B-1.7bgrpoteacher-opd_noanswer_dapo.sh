@@ -264,7 +264,7 @@ RM_ARGS=(
 )
 
 EVAL_ARGS=(
-    --eval-interval 30
+    --eval-interval 10
     --eval-config "${EVAL_CONFIG_PATH}"
     --log-passrate
     --save-debug-rollout-data /root/slime_siqi/output/debug_rollout/{rollout_id}.pt
@@ -316,7 +316,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-8b-opd-noanswer-dapo
+   --wandb-group qwen3-1.7B-1.7bgrpoteacher-opd-noanswer-dapo
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -347,8 +347,8 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=6,7
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 2 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export CUDA_VISIBLE_DEVICES=1,8,9
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 3 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 set +e
 echo "Submitting Ray job..."
@@ -358,13 +358,13 @@ ray job submit --submission-id "${RAY_JOB_ID}" --address="http://127.0.0.1:8265"
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "6,7"
+        "CUDA_VISIBLE_DEVICES": "1,8,9"
      }
    }' \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 1 \
-   --rollout-num-gpus 1 \
+   --rollout-num-gpus 2 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \

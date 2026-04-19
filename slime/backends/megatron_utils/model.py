@@ -24,6 +24,11 @@ from megatron.training.training import get_model
 
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.opd_token_stats import (
+    compute_teacher_rank_at_k_tensor,
+    compute_topk_overlap_ratio_tensor,
+    extract_global_topk_token_ids,
+)
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
@@ -433,7 +438,12 @@ def _compute_opsd_jsd_in_forward(
     opsd_gate_values = []      # only populated when loss_type == "kl_biased_ppo"
     opsd_clip_fracs = []       # only populated when opsd_token_clip > 0
     opsd_token_signal_values = []  # only populated when opsd_advantage_masking is enabled
+    opsd_teacher_sampled_log_probs = []
+    opd_diag_topk_overlap = []
+    opd_diag_teacher_rank_at_k = []
     _compute_token_signal = getattr(args, "opsd_advantage_masking", False) or getattr(args, "opsd_advantage_weighting", False)
+    _diag_enabled = bool(getattr(args, "opd_token_stats", False))
+    _diag_topk = int(getattr(args, "opd_token_stats_topk", 50))
     _eos_max_len = float(getattr(args, "rollout_max_response_len", 8192) or 8192)
     student_end = 0
     teacher_end = 0
@@ -559,6 +569,34 @@ def _compute_opsd_jsd_in_forward(
             ).squeeze(-1)  # [resp_len]
             opsd_token_signal_values.append((log_pi_T - log_pi_S).detach())
 
+        if _diag_enabled and resp_len > 0:
+            with torch.no_grad():
+                teacher_sampled_lp = compute_log_probs(
+                    t_logits.float().clone(),
+                    response_tokens_i,
+                    tp_group,
+                ).squeeze(-1)
+                teacher_topk_ids = extract_global_topk_token_ids(
+                    t_logits.float(),
+                    _diag_topk,
+                    process_group=tp_group,
+                    tp_rank=mpu.get_tensor_model_parallel_rank(),
+                )
+                student_topk_ids = extract_global_topk_token_ids(
+                    s_logits.float(),
+                    _diag_topk,
+                    process_group=tp_group,
+                    tp_rank=mpu.get_tensor_model_parallel_rank(),
+                )
+                opsd_teacher_sampled_log_probs.append(teacher_sampled_lp.detach())
+                opd_diag_topk_overlap.append(
+                    compute_topk_overlap_ratio_tensor(student_topk_ids, teacher_topk_ids, _diag_topk).detach()
+                )
+                opd_diag_teacher_rank_at_k.append(
+                    compute_teacher_rank_at_k_tensor(response_tokens_i.long(), teacher_topk_ids, _diag_topk).detach()
+                )
+
+
         # ---- EOS encouragement loss (optional) ----
         # Compute -log p_S(EOS | context_t) * (t / max_len) for each response position.
         # Uses raw (non-temperature-scaled) student logits so the loss targets the
@@ -590,6 +628,13 @@ def _compute_opsd_jsd_in_forward(
         batch["opsd_clip_fracs"] = opsd_clip_fracs
     if opsd_token_signal_values:
         batch["opsd_token_signal"] = opsd_token_signal_values
+    if opsd_teacher_sampled_log_probs:
+        batch["opsd_teacher_sampled_log_probs"] = opsd_teacher_sampled_log_probs
+    if opd_diag_topk_overlap:
+        batch["opd_diag_topk_overlap"] = opd_diag_topk_overlap
+    if opd_diag_teacher_rank_at_k:
+        batch["opd_diag_teacher_rank_at_k"] = opd_diag_teacher_rank_at_k
+
 
 
 def _prefetch_opsd_teacher_logits(
@@ -770,6 +815,9 @@ def train_one_step(
                 "opd_distill_sample_mask",
                 "opd_topk_token_ids",
                 "opd_topk_teacher_log_probs",
+                "opd_diag_topk_overlap",
+                "opd_diag_teacher_rank_at_k",
+
                 "teacher_tokens",
                 "teacher_prompt_lengths",
             ],
@@ -788,7 +836,12 @@ def train_one_step(
         _opsd_active = (
             args.use_opd
             and args.opd_type == "opsd"
-            and (args.opsd_jsd_coef > 0 or getattr(args, "opsd_advantage_masking", False) or getattr(args, "opsd_advantage_weighting", False))
+            and (
+                args.opsd_jsd_coef > 0
+                or getattr(args, "opsd_advantage_masking", False)
+                or getattr(args, "opsd_advantage_weighting", False)
+                or getattr(args, "opd_token_stats", False)
+            )
             and batch.get("teacher_tokens") is not None
         )
         if _opsd_active:

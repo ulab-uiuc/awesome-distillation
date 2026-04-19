@@ -7,11 +7,13 @@ import aiohttp
 import torch
 
 from slime.rollout.rm_hub import grade_answer_verl
+from slime.utils.opd_token_stats import compute_teacher_rank_at_k, compute_topk_overlap_ratio
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 _RM_SEMAPHORES: dict[tuple[int, int], asyncio.Semaphore] = {}
+_OPTIONAL_LOGPROB_WARNING_COUNTS: dict[str, int] = {}
 
 
 def _get_rm_semaphore(args) -> asyncio.Semaphore:
@@ -366,11 +368,13 @@ def _extract_id_logprob_map(raw) -> dict[int, float]:
     return mapping
 
 
-def _extract_teacher_topk_log_probs(
+def _extract_response_aux_id_logprob_maps(
     teacher_output: dict,
     response_items: list,
-    requested_token_ids: list[list[int]],
-) -> list[list[float]]:
+    *,
+    full_input_len: int,
+    response_start: int,
+) -> list[dict[int, float]]:
     meta_info = teacher_output.get("meta_info", {}) if isinstance(teacher_output, dict) else {}
     sidecar = None
     for key in [
@@ -384,18 +388,19 @@ def _extract_teacher_topk_log_probs(
             break
 
     if sidecar is not None:
+        # Reuse the same response alignment as input_token_logprobs rather than
+        # inferring offsets from the sidecar length alone.
         response_sidecar = _slice_response_items(
             sidecar,
-            full_input_len=len(sidecar),
-            response_start=max(len(sidecar) - len(requested_token_ids), 0),
-            response_len=len(requested_token_ids),
+            full_input_len=full_input_len,
+            response_start=response_start,
+            response_len=len(response_items),
         )
     else:
         response_sidecar = [None] * len(response_items)
 
-    teacher_topk: list[list[float]] = []
-    for pos, tok_ids in enumerate(requested_token_ids):
-        item = response_items[pos] if pos < len(response_items) else None
+    aux_maps: list[dict[int, float]] = []
+    for pos, item in enumerate(response_items):
         aux_map = {}
         if pos < len(response_sidecar):
             aux_map = _extract_id_logprob_map(response_sidecar[pos])
@@ -407,31 +412,186 @@ def _extract_teacher_topk_log_probs(
                         break
         if not aux_map and isinstance(item, (list, tuple)) and len(item) >= 3:
             aux_map = _extract_id_logprob_map(item[2])
+        aux_maps.append(aux_map)
+    return aux_maps
+
+
+def _extract_response_top_logprob_maps(
+    teacher_output: dict,
+    response_items: list,
+    *,
+    full_input_len: int,
+    response_start: int,
+) -> list[dict[int, float]]:
+    meta_info = teacher_output.get("meta_info", {}) if isinstance(teacher_output, dict) else {}
+    sidecar = None
+    for key in ["input_top_logprobs", "input_token_top_logprobs"]:
+        if key in meta_info:
+            sidecar = meta_info[key]
+            break
+
+    if sidecar is not None:
+        response_sidecar = _slice_response_items(
+            sidecar,
+            full_input_len=full_input_len,
+            response_start=response_start,
+            response_len=len(response_items),
+        )
+    else:
+        response_sidecar = [None] * len(response_items)
+
+    aux_maps: list[dict[int, float]] = []
+    for pos, item in enumerate(response_items):
+        aux_map = {}
+        if pos < len(response_sidecar):
+            aux_map = _extract_id_logprob_map(response_sidecar[pos])
+        if not aux_map and isinstance(item, dict):
+            for key in ["top_logprobs", "top_logprob", "logprobs"]:
+                if key in item:
+                    aux_map = _extract_id_logprob_map(item[key])
+                    if aux_map:
+                        break
+        if not aux_map and isinstance(item, (list, tuple)) and len(item) >= 3:
+            aux_map = _extract_id_logprob_map(item[2])
+        aux_maps.append(aux_map)
+    return aux_maps
+
+
+def _extract_requested_token_log_probs(
+    aux_maps: list[dict[int, float]],
+    requested_token_ids: list[list[int]],
+    *,
+    missing_error_prefix: str,
+) -> list[list[float]]:
+    rows: list[list[float]] = []
+    for pos, tok_ids in enumerate(requested_token_ids):
+        aux_map = aux_maps[pos] if pos < len(aux_maps) else {}
         if not aux_map:
-            raise ValueError(
-                "Missing teacher token-level top-k logprobs in SGLang response. "
-                "full_vocab_topk_reverse_kl requires complete top-k logprob data."
-            )
+            raise ValueError(f"{missing_error_prefix} at position {pos}: token-level auxiliary logprobs are missing.")
         row = []
         for tid in tok_ids:
             if int(tid) not in aux_map:
-                raise ValueError(
-                    f"Teacher logprob for requested token id {tid} is missing at position {pos}."
-                )
+                raise ValueError(f"{missing_error_prefix} at position {pos}: token id {tid} is missing.")
             row.append(float(aux_map[int(tid)]))
-        teacher_topk.append(row)
-    return teacher_topk
+        rows.append(row)
+    return rows
+
+
+def _extract_optional_requested_token_log_probs(
+    aux_maps: list[dict[int, float]],
+    requested_token_ids: list[list[int]],
+    *,
+    fallback_aux_maps: list[dict[int, float]] | None = None,
+    missing_value: float = float("nan"),
+    warning_prefix: str | None = None,
+) -> list[list[float]]:
+    rows: list[list[float]] = []
+    fallback_positions: list[int] = []
+    missing_positions: list[int] = []
+    for pos, tok_ids in enumerate(requested_token_ids):
+        aux_map = aux_maps[pos] if pos < len(aux_maps) else {}
+        fallback_map = fallback_aux_maps[pos] if fallback_aux_maps is not None and pos < len(fallback_aux_maps) else {}
+        row = []
+        used_fallback = False
+        has_missing = False
+        for tid in tok_ids:
+            tid = int(tid)
+            if tid in aux_map:
+                row.append(float(aux_map[tid]))
+            elif tid in fallback_map:
+                row.append(float(fallback_map[tid]))
+                used_fallback = True
+            else:
+                row.append(float(missing_value))
+                has_missing = True
+        if used_fallback:
+            fallback_positions.append(pos)
+        if has_missing:
+            missing_positions.append(pos)
+        rows.append(row)
+
+    if warning_prefix is not None and (fallback_positions or missing_positions):
+        count = _OPTIONAL_LOGPROB_WARNING_COUNTS.get(warning_prefix, 0) + 1
+        _OPTIONAL_LOGPROB_WARNING_COUNTS[warning_prefix] = count
+        if count <= 3 or count % 50 == 0:
+            suffix = ""
+            if count > 3:
+                suffix = f" (occurrence={count}; intermediate warnings suppressed)"
+            logger.warning(
+                "%s: exact_positions=%d/%d, fallback_positions=%s, missing_positions=%s%s",
+                warning_prefix,
+                len(requested_token_ids) - len(fallback_positions) - len(missing_positions),
+                len(requested_token_ids),
+                fallback_positions[:20],
+                missing_positions[:20],
+                suffix,
+            )
+    return rows
+
+
+def _extract_teacher_topk_token_ids(
+    aux_maps: list[dict[int, float]],
+    topk: int,
+) -> list[list[int]]:
+    teacher_topk_ids: list[list[int]] = []
+    for pos, aux_map in enumerate(aux_maps):
+        if not aux_map:
+            raise ValueError(f"Missing teacher top-k logprobs at position {pos}.")
+        sorted_pairs = sorted(aux_map.items(), key=lambda x: x[1], reverse=True)
+        if len(sorted_pairs) < topk:
+            raise ValueError(
+                f"Teacher top-k at position {pos} has only {len(sorted_pairs)} entries, expected at least {topk}."
+            )
+        teacher_topk_ids.append([int(token_id) for token_id, _ in sorted_pairs[:topk]])
+    return teacher_topk_ids
+
+
+def _extract_teacher_topk_log_probs(
+    aux_maps: list[dict[int, float]],
+    requested_token_ids: list[list[int]],
+) -> list[list[float]]:
+    return _extract_requested_token_log_probs(
+        aux_maps,
+        requested_token_ids,
+        missing_error_prefix="Missing teacher token-level top-k logprobs",
+    )
+
+
+def _combine_requested_token_ids(
+    primary: list[list[int]] | None,
+    extra: list[list[int]] | None,
+) -> list[list[int]] | None:
+    if primary is None and extra is None:
+        return None
+    if primary is None:
+        return [list(row) for row in extra]
+    if extra is None:
+        return [list(row) for row in primary]
+    if len(primary) != len(extra):
+        raise ValueError(f"Requested token-id length mismatch: {len(primary)} vs {len(extra)}.")
+    combined: list[list[int]] = []
+    for row_primary, row_extra in zip(primary, extra, strict=False):
+        merged = list(dict.fromkeys([int(x) for x in row_primary] + [int(x) for x in row_extra]))
+        combined.append(merged)
+    return combined
+
+
+def _get_sample_student_topk_ids(sample: Sample) -> list[list[int]] | None:
+    if getattr(sample, "opd_diag_student_topk_token_ids", None) is not None:
+        return getattr(sample, "opd_diag_student_topk_token_ids")
+    if getattr(sample, "opd_topk_token_ids", None) is not None:
+        return getattr(sample, "opd_topk_token_ids")
+    return None
 
 
 async def reward_func(args, sample, **kwargs):
     teacher_input_ids = _build_teacher_input_ids(args, sample)
     response_len = int(sample.response_length or 0)
     response_start = max(len(teacher_input_ids) - response_len, 0)
-    use_topk_kl = (
-        getattr(args, "use_opd", False)
-        and getattr(args, "opd_type", None) == "sglang"
-        and getattr(args, "opd_kl_mode", "token_reverse_kl") == "full_vocab_topk_reverse_kl"
-    )
+    use_opd_sglang = getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"
+    use_topk_kl = use_opd_sglang and getattr(args, "opd_kl_mode", "token_reverse_kl") == "full_vocab_topk_reverse_kl"
+    diag_enabled = use_opd_sglang and bool(getattr(args, "opd_token_stats", False))
+    diag_topk = int(getattr(args, "opd_token_stats_topk", 50))
     payload = {
         "input_ids": teacher_input_ids,
         "sampling_params": {
@@ -449,6 +609,8 @@ async def reward_func(args, sample, **kwargs):
         # instead, which we discard via the tail-slice in _slice_response_items.
         "logprob_start_len": max(response_start - 1, 0),
     }
+    topk_request_size = 0
+    requested_topk_token_ids = None
     if use_topk_kl:
         topk_token_ids = getattr(sample, "opd_topk_token_ids", None)
         topk_student_lp = getattr(sample, "opd_topk_student_log_probs", None)
@@ -461,7 +623,17 @@ async def reward_func(args, sample, **kwargs):
                 f"Student top-k data length mismatch: token_ids={len(topk_token_ids)}, "
                 f"student_logprobs={len(topk_student_lp)}, response_len={response_len}."
             )
-        payload["token_ids_logprob"] = topk_token_ids
+        requested_topk_token_ids = topk_token_ids
+        topk_request_size = max(topk_request_size, int(getattr(args, "opd_topk", 50)))
+    if diag_enabled:
+        topk_request_size = max(topk_request_size, diag_topk)
+
+
+    requested_token_ids = _combine_requested_token_ids(requested_topk_token_ids, None)
+    if requested_token_ids is not None:
+        payload["token_ids_logprob"] = requested_token_ids
+    if topk_request_size > 0:
+        payload["top_logprobs_num"] = topk_request_size
 
     session_kwargs = {}
     rm_semaphore = _get_rm_semaphore(args)
@@ -472,11 +644,12 @@ async def reward_func(args, sample, **kwargs):
                 teacher_output = await resp.json()
 
     teacher_topk_log_probs = None
-    if use_topk_kl:
+    teacher_topk_token_ids = None
+    if use_topk_kl or diag_enabled:
         input_items = teacher_output.get("meta_info", {}).get("input_token_logprobs")
         if input_items is None:
             raise ValueError(
-                "full_vocab_topk_reverse_kl requires `meta_info.input_token_logprobs` from teacher response."
+                "OPD token diagnostics require `meta_info.input_token_logprobs` from teacher response."
             )
         response_items = _slice_response_items(
             input_items,
@@ -484,11 +657,27 @@ async def reward_func(args, sample, **kwargs):
             response_start=response_start,
             response_len=response_len,
         )
-        teacher_topk_log_probs = _extract_teacher_topk_log_probs(
+        aux_maps = _extract_response_aux_id_logprob_maps(
             teacher_output=teacher_output,
             response_items=response_items,
-            requested_token_ids=payload["token_ids_logprob"],
+            full_input_len=len(teacher_input_ids),
+            response_start=response_start,
         )
+        teacher_top_logprob_maps = None
+        if use_topk_kl:
+            teacher_topk_log_probs = _extract_teacher_topk_log_probs(aux_maps, requested_topk_token_ids)
+        if diag_enabled:
+            teacher_top_logprob_maps = _extract_response_top_logprob_maps(
+                teacher_output=teacher_output,
+                response_items=response_items,
+                full_input_len=len(teacher_input_ids),
+                response_start=response_start,
+            )
+            teacher_topk_token_ids = _extract_teacher_topk_token_ids(
+                teacher_top_logprob_maps,
+                diag_topk,
+            )
+
 
     # Dual-metric grading for diagnosis:
     # - strict follows dataset format (boxed/answer) inferred from metadata
@@ -512,6 +701,7 @@ async def reward_func(args, sample, **kwargs):
         "teacher_input_len": len(teacher_input_ids),
         "teacher_response_start": response_start,
         "teacher_topk_log_probs": teacher_topk_log_probs,
+        "teacher_topk_token_ids": teacher_topk_token_ids,
         "accuracy_strict": accuracy_strict,
         "accuracy_relaxed": accuracy_relaxed,
         # Backward-compatible alias for existing scripts/checkpoints.
@@ -537,6 +727,8 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     response_lengths = [sample.response_length for sample in samples]
     use_opd_sglang = getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"
     opd_distill_max_response_len = int(getattr(args, "opd_distill_max_response_len", 2048))
+    diag_enabled = use_opd_sglang and bool(getattr(args, "opd_token_stats", False))
+    diag_topk = int(getattr(args, "opd_token_stats_topk", 50))
 
     if use_opd_sglang:
         for sample, response_length in zip(samples, response_lengths, strict=False):
@@ -549,6 +741,7 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     teacher_input_lens = []
     teacher_response_starts = []
     teacher_topk_logprobs_list = []
+    teacher_topk_token_ids_list = []
     for sample in samples:
         reward = sample.reward
         if isinstance(reward, dict) and "teacher_output" in reward:
@@ -559,6 +752,7 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
                 int(reward.get("teacher_response_start", max(len(sample.tokens) - sample.response_length, 0)))
             )
             teacher_topk_logprobs_list.append(reward.get("teacher_topk_log_probs"))
+            teacher_topk_token_ids_list.append(reward.get("teacher_topk_token_ids"))
         else:
             # Backward-compatible path for historical checkpoints/scripts.
             teacher_output = reward
@@ -566,6 +760,7 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
             teacher_input_lens.append(len(sample.tokens))
             teacher_response_starts.append(max(len(sample.tokens) - sample.response_length, 0))
             teacher_topk_logprobs_list.append(None)
+            teacher_topk_token_ids_list.append(None)
         teacher_outputs.append(teacher_output)
 
     # Extract teacher log-probs from the sglang response
@@ -609,6 +804,34 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
                 )
             sample.opd_topk_student_log_probs = torch.tensor(student_topk, dtype=torch.float32)
             sample.opd_topk_teacher_log_probs = torch.tensor(teacher_topk, dtype=torch.float32)
+
+    if diag_enabled:
+        for idx, (sample, teacher_topk_ids) in enumerate(
+            zip(samples, teacher_topk_token_ids_list, strict=False)
+        ):
+            student_topk_ids = _get_sample_student_topk_ids(sample)
+            if student_topk_ids is None or teacher_topk_ids is None:
+                raise ValueError(f"Sample {idx}: missing student/teacher top-k ids for OPD token diagnostics.")
+            if len(student_topk_ids) != sample.response_length or len(teacher_topk_ids) != sample.response_length:
+                raise ValueError(
+                    f"Sample {idx}: top-k length mismatch for token diagnostics. "
+                    f"student={len(student_topk_ids)}, teacher={len(teacher_topk_ids)}, response={sample.response_length}."
+                )
+            response_tokens = list(sample.tokens[-sample.response_length:]) if sample.response_length > 0 else []
+            sample.opd_diag_topk_overlap = torch.tensor(
+                [
+                    compute_topk_overlap_ratio(student_topk_ids[pos], teacher_topk_ids[pos], diag_topk)
+                    for pos in range(sample.response_length)
+                ],
+                dtype=torch.float32,
+            )
+            sample.opd_diag_teacher_rank_at_k = torch.tensor(
+                [
+                    compute_teacher_rank_at_k(response_tokens[pos], teacher_topk_ids[pos], diag_topk)
+                    for pos in range(sample.response_length)
+                ],
+                dtype=torch.float32,
+            )
 
     # Return scalar rewards for GRPO/PPO advantage estimator.
     # When --opd-zero-task-reward is enabled, task rewards are zeroed so training
