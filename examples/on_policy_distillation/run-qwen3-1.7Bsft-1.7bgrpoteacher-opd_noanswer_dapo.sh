@@ -111,8 +111,8 @@ export PYTHONBUFFERED=16
 
 TEACHER_IP="0.0.0.0"
 TEACHER_PORT="${TEACHER_PORT:-30086}"
-TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-Qwen/Qwen3-8B}"
-TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-0}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-output/Qwen3-1.7B_opsd_masked_grpo_dapo_hf}"
+TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-7}"
 TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.70}"
 RM_MAX_CONCURRENCY="${RM_MAX_CONCURRENCY:-4}"
 TEACHER_LOG_FILE="/tmp/sglang_teacher_qwen3_8b_$(date +%s).log"
@@ -202,8 +202,8 @@ $PREPROCESS --dataset HuggingFaceH4/MATH-500     --split test  --output /root/ma
 ###############################################################################
 
 CKPT_ARGS=(
-   --hf-checkpoint Qwen/Qwen3-1.7B
-   --ref-load "/root/checkpoints_siqi/Qwen3-1.7B_torch_dist"
+   --hf-checkpoint output/Qwen3-1.7B_openthoughts_sft_step198
+   --ref-load "output/Qwen3-1.7B_openthoughts_sft_step198_torch_dist"
    --save "${OPD_SAVE:-/root/slime_siqi/output/Qwen3-1.7B_8B_opd_noanswer_dapo/}"
    --save-interval 2000
 )
@@ -319,7 +319,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-1.7bgrpoteacher-opd-noanswer-dapo
+   --wandb-group qwen3-1.7Bsft-1.7bgrpoteacher-opd-noanswer-dapo
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 

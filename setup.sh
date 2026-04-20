@@ -188,17 +188,44 @@ python examples/on_policy_distillation/plot_token_winner_interactive.py \
 ps -o pid,ppid,user,tty,lstart,cmd -p 314845
 
 
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "default",
+    "messages": [
+      {"role": "user", "content": "What is SGLang?"}
+    ],
+    "temperature": 0.7
+  }'
+
+
+curl http://localhost:30006/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "your-model-name",
+    "messages": [
+      {"role": "user", "content": "How many rs are in strawberry?"}
+    ],
+    "temperature": 0.6,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  }'
+
+
+
 CUDA_VISIBLE_DEVICES=1 python3 -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30000 --host 0.0.0.0 --tp 1  --mem-fraction-static  0.8   --watchdog-timeout 3600
 
 
 cd /root/slime_siqi                                                                                                       
                                                                                                                             
-python3 tools/convert_fsdp_to_hf.py \
-  --input-dir /root/slime_siqi/output/Qwen3-1.7B_8B_opd_noanswer_dapo/iter_0000029 \
-  --output-dir /root/checkpoints_siqi/Qwen3-1.7B_step29 \
+python3 tools/convert_torch_dist_to_hf.py \
+  --input-dir output/Qwen3-1.7B_sft_openthoughts_math/iter_0000198 \
+  --output-dir /root/checkpoints_siqi/Qwen3-1.7B_openthoughts_sft_step198 \
   --origin-hf-dir /root/checkpoints_siqi/Qwen3-1.7B
 
 
-CUDA_VISIBLE_DEVICES=0 python3 -m sglang.launch_server --model-path output/Qwen3-1.7B_opsd_masked_grpo_dapo_hf --port 30000 --host 0.0.0.0 --tp 1
+CUDA_VISIBLE_DEVICES=2 python3 -m sglang.launch_server --model-path output/Qwen3-1.7B_openthoughts_sft_step198 --port 30000 --host 0.0.0.0 --tp 1
 
 
+CUDA_VISIBLE_DEVICES=2,3 python3 -m sglang.launch_server --model-path output/Qwen3-1.7B_opsd_masked_grpo_dapo_hf --port 30006 --host 0.0.0.0 --tp 2

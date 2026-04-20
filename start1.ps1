@@ -60,10 +60,10 @@ source scripts/models/qwen3-1.7B.sh
 
 # 4. 将 HuggingFace 模型转换为 torch_dist 格式
 echo "=== Converting HF checkpoint to torch_dist format ==="
-CUDA_VISIBLE_DEVICES=2,5,7,9 PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
+CUDA_VISIBLE_DEVICES=7 PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
     ${MODEL_ARGS[@]} \
-    --hf-checkpoint /root/Qwen3-1.7B \
-    --save /root/Qwen3-1.7B_torch_dist
+    --hf-checkpoint output/Qwen3-1.7B_openthoughts_sft_step198 \
+    --save output/Qwen3-1.7B_openthoughts_sft_step198_torch_dist
 
-mkdir -p /root/slime/output/Qwen3-1.7B_opsd_slime/
+# mkdir -p /root/slime/output/Qwen3-1.7B_opsd_slime/
 echo "=== All done! ==="
