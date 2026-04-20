@@ -199,6 +199,6 @@ python3 tools/convert_fsdp_to_hf.py \
   --origin-hf-dir /root/checkpoints_siqi/Qwen3-1.7B
 
 
-CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path output/Qwen3-1.7B_opsd_masked_grpo_dapo_hf --port 30002 --host 0.0.0.0 --tp 1
+CUDA_VISIBLE_DEVICES=0 python3 -m sglang.launch_server --model-path output/Qwen3-1.7B_opsd_masked_grpo_dapo_hf --port 30000 --host 0.0.0.0 --tp 1
 
 

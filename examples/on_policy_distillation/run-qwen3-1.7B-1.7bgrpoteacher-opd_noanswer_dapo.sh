@@ -17,11 +17,11 @@
 #     --opd-kl-mode full_vocab_topk_reverse_kl --opd-topk 50
 
 OPD_KL_MODE="token_reverse_kl"
-OPD_TOPK="50"
+OPD_TOPK="20"
 OPD_EXPLICIT_LOSS_COEF="1.0"
 OPD_DISTILL_MAX_RESPONSE_LEN="${OPD_DISTILL_MAX_RESPONSE_LEN:-8192}"
 OPD_TOKEN_STATS="${OPD_TOKEN_STATS:-1}"
-OPD_TOKEN_STATS_TOPK="${OPD_TOKEN_STATS_TOPK:-50}"
+OPD_TOKEN_STATS_TOPK="${OPD_TOKEN_STATS_TOPK:-20}"
 OPD_TOKEN_STATS_REPEAT_NGRAM="${OPD_TOKEN_STATS_REPEAT_NGRAM:-3}"
 OPD_TOKEN_STATS_EOS_TOKEN_ID="${OPD_TOKEN_STATS_EOS_TOKEN_ID:-151645}"
 
@@ -109,10 +109,10 @@ export PYTHONBUFFERED=16
 # Step -1: Start external SGLang teacher server (Qwen3-8B)
 ###############################################################################
 
-TEACHER_IP="172.22.224.251"
-TEACHER_PORT="${TEACHER_PORT:-30000}"
+TEACHER_IP="0.0.0.0"
+TEACHER_PORT="${TEACHER_PORT:-30086}"
 TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-Qwen/Qwen3-8B}"
-TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-1}"
+TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-0}"
 TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.70}"
 RM_MAX_CONCURRENCY="${RM_MAX_CONCURRENCY:-4}"
 TEACHER_LOG_FILE="/tmp/sglang_teacher_qwen3_8b_$(date +%s).log"
@@ -347,7 +347,7 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=1,8,9
+export CUDA_VISIBLE_DEVICES=2,3,4
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 3 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 set +e
@@ -358,7 +358,7 @@ ray job submit --submission-id "${RAY_JOB_ID}" --address="http://127.0.0.1:8265"
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "1,8,9"
+        "CUDA_VISIBLE_DEVICES": "2,3,4"
      }
    }' \
    -- python3 train.py \
