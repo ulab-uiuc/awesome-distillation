@@ -16,15 +16,15 @@
 #   bash examples/on_policy_distillation/run-qwen3-1.7B-8b-opd_noanswer_dapo.sh \
 #     --opd-kl-mode full_vocab_topk_reverse_kl --opd-topk 50
 
-OPD_KL_MODE="token_reverse_kl"
+OPD_KL_MODE="topk_reverse_kl_notail_sg"
 OPD_TOPK="20"
 OPD_EXPLICIT_LOSS_COEF="1.0"
 OPD_DISTILL_MAX_RESPONSE_LEN="${OPD_DISTILL_MAX_RESPONSE_LEN:-8192}"
-OPD_TOKEN_STATS="${OPD_TOKEN_STATS:-0}"
+OPD_TOKEN_STATS="${OPD_TOKEN_STATS:-1}"
 OPD_TOKEN_STATS_TOPK="${OPD_TOKEN_STATS_TOPK:-20}"
 OPD_TOKEN_STATS_REPEAT_NGRAM="${OPD_TOKEN_STATS_REPEAT_NGRAM:-3}"
 OPD_TOKEN_STATS_EOS_TOKEN_ID="${OPD_TOKEN_STATS_EOS_TOKEN_ID:-151645}"
-OPD_TEACHER_SFT="${OPD_TEACHER_SFT:-1}"
+OPD_TEACHER_SFT="${OPD_TEACHER_SFT:-0}"
 OPD_TEACHER_SFT_LOSS_COEF="${OPD_TEACHER_SFT_LOSS_COEF:-1.0}"
 OPD_TEACHER_SFT_TEMPERATURE="${OPD_TEACHER_SFT_TEMPERATURE:-0.5}"
 OPD_TEACHER_SFT_TOP_P="${OPD_TEACHER_SFT_TOP_P:-0.95}"
@@ -70,13 +70,16 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Supported args: --opd-kl-mode <token_reverse_kl|full_vocab_topk_reverse_kl> --opd-topk <int> --opd-explicit-loss-coef <float> --opd-distill-max-response-len <-1|int> --opd-teacher-sft [--opd-teacher-sft-loss-coef <float>] [--opd-teacher-sft-temperature <float>] [--opd-teacher-sft-top-p <float>] [--opd-teacher-sft-max-response-len <int>]"
+            echo "Supported args: --opd-kl-mode <token_reverse_kl|full_vocab_topk_reverse_kl|topk_reverse_kl_notail|topk_reverse_kl_notail_sg> --opd-topk <int> --opd-explicit-loss-coef <float> --opd-distill-max-response-len <-1|int> --opd-teacher-sft [--opd-teacher-sft-loss-coef <float>] [--opd-teacher-sft-temperature <float>] [--opd-teacher-sft-top-p <float>] [--opd-teacher-sft-max-response-len <int>]"
             exit 1
             ;;
     esac
 done
 
-if [[ "${OPD_KL_MODE}" != "token_reverse_kl" && "${OPD_KL_MODE}" != "full_vocab_topk_reverse_kl" ]]; then
+if [[ "${OPD_KL_MODE}" != "token_reverse_kl" && \
+      "${OPD_KL_MODE}" != "full_vocab_topk_reverse_kl" && \
+      "${OPD_KL_MODE}" != "topk_reverse_kl_notail" && \
+      "${OPD_KL_MODE}" != "topk_reverse_kl_notail_sg" ]]; then
     echo "Invalid --opd-kl-mode: ${OPD_KL_MODE}"
     exit 1
 fi
@@ -156,10 +159,10 @@ export PYTHONBUFFERED=16
 
 TEACHER_IP="0.0.0.0"
 TEACHER_PORT="${TEACHER_PORT:-30086}"
-TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-Qwen/Qwen3-8B}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-output/Qwen3-1.7B_opsd_masked_grpo_dapo_hf}"
 TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-7}"
 TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.70}"
-RM_MAX_CONCURRENCY="${RM_MAX_CONCURRENCY:-32}"
+RM_MAX_CONCURRENCY="${RM_MAX_CONCURRENCY:-64}"
 TEACHER_LOG_FILE="/tmp/sglang_teacher_qwen3_8b_$(date +%s).log"
 TEACHER_STARTED_BY_SCRIPT=0
 
@@ -329,7 +332,7 @@ EVAL_ARGS=(
     --eval-config "${EVAL_CONFIG_PATH}"
     --log-passrate
     --save-debug-rollout-data /root/slime_siqi/output/debug_rollout/{rollout_id}.pt
-    # --skip-eval-before-train
+    --skip-eval-before-train
 )
 
 PERF_ARGS=(
@@ -378,7 +381,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-1.7bgrpoteacher-opd-noanswer-dapo
+   --wandb-group qwen3-1.7B-1.7bgrpoteacher-opd-noanswer-dapo-stopgrad_reversekl_top50
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -409,7 +412,7 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=2,3,4
+export CUDA_VISIBLE_DEVICES=4,8,9
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 3 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 set +e
@@ -420,7 +423,7 @@ ray job submit --submission-id "${RAY_JOB_ID}" --address="http://127.0.0.1:8265"
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "2,3,4"
+        "CUDA_VISIBLE_DEVICES": "4,8,9"
      }
    }' \
    -- python3 train.py \

@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import asyncio
@@ -7,6 +8,7 @@ import aiohttp
 import torch
 
 from slime.rollout.rm_hub import grade_answer_verl
+from slime.utils.mask_utils import MultiTurnLossMaskGenerator
 from slime.utils.opd_token_stats import compute_teacher_rank_at_k, compute_topk_overlap_ratio
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
@@ -14,6 +16,7 @@ from slime.utils.types import Sample
 logger = logging.getLogger(__name__)
 _RM_SEMAPHORES: dict[tuple[int, int], asyncio.Semaphore] = {}
 _OPTIONAL_LOGPROB_WARNING_COUNTS: dict[str, int] = {}
+_MASK_GENERATORS: dict[tuple[str, str], MultiTurnLossMaskGenerator] = {}
 
 
 def _get_rm_semaphore(args) -> asyncio.Semaphore:
@@ -91,14 +94,26 @@ def _get_teacher_tokenizer(args):
     return _load_cached_tokenizer(tokenizer_source)
 
 
-def _build_teacher_input_ids(args, sample: Sample) -> list[int]:
+def _get_actor_tokenizer(args):
+    tokenizer_source = getattr(args, "hf_checkpoint", None) or getattr(args, "opd_teacher_tokenizer", None)
+    if not tokenizer_source:
+        raise ValueError("Cannot build teacher-SFT loss mask because --hf-checkpoint is empty.")
+    return _load_cached_tokenizer(tokenizer_source)
+
+
+def _get_mask_generator(args):
+    tokenizer_source = getattr(args, "hf_checkpoint", None) or getattr(args, "opd_teacher_tokenizer", None)
+    tokenizer_type = getattr(args, "loss_mask_type", "qwen")
+    key = (str(tokenizer_source), str(tokenizer_type))
+    generator = _MASK_GENERATORS.get(key)
+    if generator is None:
+        generator = MultiTurnLossMaskGenerator(_get_actor_tokenizer(args), tokenizer_type=tokenizer_type)
+        _MASK_GENERATORS[key] = generator
+    return generator
+
+
+def _build_teacher_user_content(args, sample: Sample) -> str:
     mode = getattr(args, "opd_teacher_info_mode", "same_as_student")
-    if mode == "same_as_student":
-        return list(sample.tokens)
-
-    if mode != "answer_only":
-        raise ValueError(f"Unsupported opd_teacher_info_mode: {mode!r}")
-
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     raw_content = _first_nonempty_text(metadata.get("raw_content"))
     student_user_content = _first_nonempty_text(
@@ -106,16 +121,34 @@ def _build_teacher_input_ids(args, sample: Sample) -> list[int]:
         raw_content,
         _extract_user_content_from_prompt(sample.prompt),
     )
+
+    if mode == "same_as_student":
+        return student_user_content
+
+    if mode != "answer_only":
+        raise ValueError(f"Unsupported opd_teacher_info_mode: {mode!r}")
+
     answer_hint = _first_nonempty_text(
         sample.label,
         metadata.get("solution"),
         metadata.get("reference_solution"),
     )
-    teacher_user_content = (
+    return (
         f"{student_user_content}\n\n" + _ANSWER_ONLY_PROMPT.format(answer=answer_hint)
         if answer_hint
         else student_user_content
     )
+
+
+def _build_teacher_prompt_input_ids(args, sample: Sample) -> list[int]:
+    mode = getattr(args, "opd_teacher_info_mode", "same_as_student")
+    if mode == "same_as_student":
+        response_len = int(sample.response_length or 0)
+        if response_len <= 0:
+            return list(sample.tokens)
+        return list(sample.tokens[:-response_len])
+
+    teacher_user_content = _build_teacher_user_content(args, sample)
 
     tokenizer = _get_teacher_tokenizer(args)
     template_kwargs = _resolve_chat_template_kwargs(args)
@@ -138,8 +171,51 @@ def _build_teacher_input_ids(args, sample: Sample) -> list[int]:
         )
 
     teacher_prompt_tokens = tokenizer.encode(teacher_prompt_text, add_special_tokens=False)
+    return teacher_prompt_tokens
+
+
+def _build_teacher_input_ids(args, sample: Sample) -> list[int]:
+    teacher_prompt_tokens = _build_teacher_prompt_input_ids(args, sample)
     response_tokens = list(sample.tokens[-sample.response_length:]) if sample.response_length > 0 else []
     return teacher_prompt_tokens + response_tokens
+
+
+def _extract_generated_token_ids(output: dict) -> list[int]:
+    meta_info = output.get("meta_info", {}) if isinstance(output, dict) else {}
+    output_items = meta_info.get("output_token_logprobs")
+    if isinstance(output_items, list):
+        token_ids = []
+        for item in output_items:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                token_ids.append(int(item[1]))
+            elif isinstance(item, dict):
+                token_id = item.get("token_id", item.get("id", item.get("token")))
+                if token_id is not None:
+                    token_ids.append(int(token_id))
+        if token_ids:
+            return token_ids
+
+    output_ids = output.get("output_ids") if isinstance(output, dict) else None
+    if isinstance(output_ids, list):
+        return [int(token_id) for token_id in output_ids]
+    return []
+
+
+def _build_teacher_sft_response_loss_mask(
+    args,
+    sample: Sample,
+    *,
+    prompt_input_ids: list[int],
+    response_token_ids: list[int],
+    response_text: str,
+) -> list[int]:
+    # prompt_input_ids already includes the generation-prompt header tokens
+    # (e.g. <|im_start|>assistant\n), so response_token_ids are purely the
+    # content tokens generated by SGLang — all should be trained on.
+    # Re-tokenizing the decoded response_text to compute a mask is unreliable
+    # (decode→re-encode is not always a round-trip), and both the match and
+    # the fallback branch produce the same [1]*len(response_token_ids) result.
+    return [1] * len(response_token_ids)
 
 
 def _extract_scalar_logprob(item) -> float:
@@ -585,13 +661,18 @@ def _get_sample_student_topk_ids(sample: Sample) -> list[list[int]] | None:
 
 
 async def reward_func(args, sample, **kwargs):
+    evaluation = bool(kwargs.get("evaluation", False))
     teacher_input_ids = _build_teacher_input_ids(args, sample)
+    teacher_prompt_input_ids = _build_teacher_prompt_input_ids(args, sample)
     response_len = int(sample.response_length or 0)
     response_start = max(len(teacher_input_ids) - response_len, 0)
     use_opd_sglang = getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"
-    use_topk_kl = use_opd_sglang and getattr(args, "opd_kl_mode", "token_reverse_kl") == "full_vocab_topk_reverse_kl"
+    use_topk_kl = use_opd_sglang and getattr(args, "opd_kl_mode", "token_reverse_kl") in (
+        "full_vocab_topk_reverse_kl", "topk_reverse_kl_notail", "topk_reverse_kl_notail_sg"
+    )
     diag_enabled = use_opd_sglang and bool(getattr(args, "opd_token_stats", False))
     diag_topk = int(getattr(args, "opd_token_stats_topk", 50))
+    teacher_sft_enabled = use_opd_sglang and bool(getattr(args, "opd_teacher_sft", False)) and not evaluation
     payload = {
         "input_ids": teacher_input_ids,
         "sampling_params": {
@@ -629,19 +710,51 @@ async def reward_func(args, sample, **kwargs):
         topk_request_size = max(topk_request_size, diag_topk)
 
 
-    requested_token_ids = _combine_requested_token_ids(requested_topk_token_ids, None)
-    if requested_token_ids is not None:
-        payload["token_ids_logprob"] = requested_token_ids
     if topk_request_size > 0:
         payload["top_logprobs_num"] = topk_request_size
 
+    teacher_sft_payload = None
+    if teacher_sft_enabled:
+        sft_max_response_len = getattr(args, "opd_teacher_sft_max_response_len", None)
+        if sft_max_response_len is None:
+            sft_max_response_len = getattr(args, "rollout_max_response_len", None)
+        if sft_max_response_len is None:
+            raise ValueError("--opd-teacher-sft requires --opd-teacher-sft-max-response-len or --rollout-max-response-len.")
+        teacher_sft_payload = {
+            "input_ids": teacher_prompt_input_ids,
+            "sampling_params": {
+                "temperature": float(getattr(args, "opd_teacher_sft_temperature", 0.0)),
+                "top_p": float(getattr(args, "opd_teacher_sft_top_p", 1.0)),
+                "max_new_tokens": int(sft_max_response_len),
+                "skip_special_tokens": False,
+                "no_stop_trim": True,
+            },
+            "return_logprob": True,
+        }
+
     session_kwargs = {}
     rm_semaphore = _get_rm_semaphore(args)
-    async with rm_semaphore:
-        async with aiohttp.ClientSession(**session_kwargs) as session:
-            async with session.post(args.rm_url, json=payload) as resp:
-                resp.raise_for_status()
-                teacher_output = await resp.json()
+    teacher_sft_output = None
+
+    async def _post_with_sem(p):
+        # Each request acquires its own slot so rm_max_concurrency limits total
+        # outstanding teacher server requests across all callers.
+        async with rm_semaphore:
+            async with aiohttp.ClientSession(**session_kwargs) as session:
+                async with session.post(args.rm_url, json=p) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+
+    if teacher_sft_payload is not None:
+        # Fire the cheap logprob pass and the expensive SFT generation in
+        # parallel — they are independent and the server can execute both
+        # concurrently. Each acquires its own semaphore slot.
+        teacher_output, teacher_sft_output = await asyncio.gather(
+            _post_with_sem(payload),
+            _post_with_sem(teacher_sft_payload),
+        )
+    else:
+        teacher_output = await _post_with_sem(payload)
 
     teacher_topk_log_probs = None
     teacher_topk_token_ids = None
@@ -657,22 +770,28 @@ async def reward_func(args, sample, **kwargs):
             response_start=response_start,
             response_len=response_len,
         )
-        aux_maps = _extract_response_aux_id_logprob_maps(
+        # Build per-position {token_id: logprob} maps from teacher's top-k output.
+        # This is the single source of truth for both topk_kl and diag paths.
+        teacher_top_logprob_maps = _extract_response_top_logprob_maps(
             teacher_output=teacher_output,
             response_items=response_items,
             full_input_len=len(teacher_input_ids),
             response_start=response_start,
         )
-        teacher_top_logprob_maps = None
         if use_topk_kl:
-            teacher_topk_log_probs = _extract_teacher_topk_log_probs(aux_maps, requested_topk_token_ids)
+            # For each position look up the teacher logprob of the student's top-k
+            # token IDs. Tokens absent from teacher's top-k are filled with the
+            # student's own rollout logprob, making that term zero in the KL loss
+            # (effectively masking the token rather than penalising it).
+            teacher_topk_log_probs = []
+            for pos, tok_ids in enumerate(requested_topk_token_ids):
+                m = teacher_top_logprob_maps[pos] if pos < len(teacher_top_logprob_maps) else {}
+                teacher_topk_log_probs.append([
+                    float(m[int(t)]) if int(t) in m
+                    else float(topk_student_lp[pos][j])
+                    for j, t in enumerate(tok_ids)
+                ])
         if diag_enabled:
-            teacher_top_logprob_maps = _extract_response_top_logprob_maps(
-                teacher_output=teacher_output,
-                response_items=response_items,
-                full_input_len=len(teacher_input_ids),
-                response_start=response_start,
-            )
             teacher_topk_token_ids = _extract_teacher_topk_token_ids(
                 teacher_top_logprob_maps,
                 diag_topk,
@@ -702,6 +821,8 @@ async def reward_func(args, sample, **kwargs):
         "teacher_response_start": response_start,
         "teacher_topk_log_probs": teacher_topk_log_probs,
         "teacher_topk_token_ids": teacher_topk_token_ids,
+        "teacher_sft_output": teacher_sft_output,
+        "teacher_sft_prompt_input_ids": teacher_prompt_input_ids if teacher_sft_output is not None else None,
         "accuracy_strict": accuracy_strict,
         "accuracy_relaxed": accuracy_relaxed,
         # Backward-compatible alias for existing scripts/checkpoints.
@@ -723,26 +844,31 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     The actual learning signal comes from the OPD KL penalty applied in compute_advantages_and_returns.
     """
     reward_key = getattr(args, "reward_key", None) or "accuracy"
+    original_samples = list(samples)
     raw_rewards = []
-    response_lengths = [sample.response_length for sample in samples]
+    response_lengths = [sample.response_length for sample in original_samples]
     use_opd_sglang = getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"
     opd_distill_max_response_len = int(getattr(args, "opd_distill_max_response_len", 2048))
     diag_enabled = use_opd_sglang and bool(getattr(args, "opd_token_stats", False))
     diag_topk = int(getattr(args, "opd_token_stats_topk", 50))
+    teacher_sft_enabled = use_opd_sglang and bool(getattr(args, "opd_teacher_sft", False))
 
     if use_opd_sglang:
-        for sample, response_length in zip(samples, response_lengths, strict=False):
+        for sample, response_length in zip(original_samples, response_lengths, strict=False):
             if opd_distill_max_response_len == -1:
                 sample.opd_distill_sample_mask = 1
             else:
                 sample.opd_distill_sample_mask = 1 if response_length <= opd_distill_max_response_len else 0
+            sample.opd_sft_sample_mask = 0
 
     teacher_outputs = []
     teacher_input_lens = []
     teacher_response_starts = []
     teacher_topk_logprobs_list = []
     teacher_topk_token_ids_list = []
-    for sample in samples:
+    teacher_sft_outputs = []
+    teacher_sft_prompt_input_ids = []
+    for sample in original_samples:
         reward = sample.reward
         if isinstance(reward, dict) and "teacher_output" in reward:
             teacher_output = reward["teacher_output"]
@@ -753,6 +879,8 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
             )
             teacher_topk_logprobs_list.append(reward.get("teacher_topk_log_probs"))
             teacher_topk_token_ids_list.append(reward.get("teacher_topk_token_ids"))
+            teacher_sft_outputs.append(reward.get("teacher_sft_output"))
+            teacher_sft_prompt_input_ids.append(reward.get("teacher_sft_prompt_input_ids"))
         else:
             # Backward-compatible path for historical checkpoints/scripts.
             teacher_output = reward
@@ -761,12 +889,14 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
             teacher_response_starts.append(max(len(sample.tokens) - sample.response_length, 0))
             teacher_topk_logprobs_list.append(None)
             teacher_topk_token_ids_list.append(None)
+            teacher_sft_outputs.append(None)
+            teacher_sft_prompt_input_ids.append(None)
         teacher_outputs.append(teacher_output)
 
     # Extract teacher log-probs from the sglang response
     teacher_log_probs = []
     for sample, reward, response_length, input_len, response_start in zip(
-        samples, teacher_outputs, response_lengths, teacher_input_lens, teacher_response_starts, strict=False
+        original_samples, teacher_outputs, response_lengths, teacher_input_lens, teacher_response_starts, strict=False
     ):
         extracted, extracted_mask = _extract_response_log_probs_with_mask(
             reward,
@@ -780,17 +910,19 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
         else:
             sample.teacher_logprob_mask = torch.ones(response_length, dtype=torch.int)
 
-    for sample, t_log_probs in zip(samples, teacher_log_probs, strict=False):
+    for sample, t_log_probs in zip(original_samples, teacher_log_probs, strict=False):
         sample.teacher_log_probs = t_log_probs
 
     use_topk_kl = (
         getattr(args, "use_opd", False)
         and getattr(args, "opd_type", None) == "sglang"
-        and getattr(args, "opd_kl_mode", "token_reverse_kl") == "full_vocab_topk_reverse_kl"
+        and getattr(args, "opd_kl_mode", "token_reverse_kl") in (
+            "full_vocab_topk_reverse_kl", "topk_reverse_kl_notail", "topk_reverse_kl_notail_sg"
+        )
     )
     if use_topk_kl:
         for idx, (sample, teacher_topk) in enumerate(
-            zip(samples, teacher_topk_logprobs_list, strict=False)
+            zip(original_samples, teacher_topk_logprobs_list, strict=False)
         ):
             student_topk = getattr(sample, "opd_topk_student_log_probs", None)
             if student_topk is None or teacher_topk is None:
@@ -807,7 +939,7 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
 
     if diag_enabled:
         for idx, (sample, teacher_topk_ids) in enumerate(
-            zip(samples, teacher_topk_token_ids_list, strict=False)
+            zip(original_samples, teacher_topk_token_ids_list, strict=False)
         ):
             student_topk_ids = _get_sample_student_topk_ids(sample)
             if student_topk_ids is None or teacher_topk_ids is None:
@@ -833,6 +965,98 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
                 dtype=torch.float32,
             )
 
+    sft_raw_rewards = []
+    sft_scalar_rewards = []
+    if teacher_sft_enabled:
+        for sample, teacher_sft_output, prompt_input_ids in zip(
+            original_samples,
+            teacher_sft_outputs,
+            teacher_sft_prompt_input_ids,
+            strict=False,
+        ):
+            if not isinstance(teacher_sft_output, dict) or not prompt_input_ids:
+                continue
+            teacher_response_tokens = _extract_generated_token_ids(teacher_sft_output)
+            if not teacher_response_tokens:
+                continue
+
+            sft_sample = copy.deepcopy(sample)
+            sft_sample.tokens = list(prompt_input_ids) + teacher_response_tokens
+            sft_sample.response = str(teacher_sft_output.get("text", "") or "")
+            sft_sample.response_length = len(teacher_response_tokens)
+            sft_sample.loss_mask = _build_teacher_sft_response_loss_mask(
+                args,
+                sample,
+                prompt_input_ids=list(prompt_input_ids),
+                response_token_ids=teacher_response_tokens,
+                response_text=sft_sample.response,
+            )
+            if len(sft_sample.loss_mask) != sft_sample.response_length:
+                raise ValueError(
+                    "Teacher-SFT loss mask length mismatch: "
+                    f"{len(sft_sample.loss_mask)} vs response_length={sft_sample.response_length}."
+                )
+            sft_sample.reward = 0.0
+            sft_sample.rollout_log_probs = [0.0] * sft_sample.response_length
+            sft_sample.teacher_log_probs = torch.zeros(sft_sample.response_length, dtype=torch.float32)
+            sft_sample.teacher_logprob_mask = torch.zeros(sft_sample.response_length, dtype=torch.int)
+            sft_sample.opd_distill_sample_mask = 0
+            sft_sample.opd_sft_sample_mask = 1
+            sft_sample.opd_topk_token_ids = (
+                [[] for _ in range(sft_sample.response_length)]
+                if getattr(sample, "opd_topk_token_ids", None) is not None
+                else None
+            )
+            sft_sample.opd_topk_student_log_probs = (
+                [[] for _ in range(sft_sample.response_length)]
+                if getattr(sample, "opd_topk_student_log_probs", None) is not None
+                else None
+            )
+            sft_sample.opd_topk_teacher_log_probs = (
+                [[] for _ in range(sft_sample.response_length)]
+                if getattr(sample, "opd_topk_teacher_log_probs", None) is not None
+                else None
+            )
+            sft_sample.opd_diag_student_topk_token_ids = None
+            sft_sample.opd_diag_topk_overlap = (
+                [0.0] * sft_sample.response_length
+                if getattr(sample, "opd_diag_topk_overlap", None) is not None
+                else None
+            )
+            sft_sample.opd_diag_teacher_rank_at_k = (
+                [0.0] * sft_sample.response_length
+                if getattr(sample, "opd_diag_teacher_rank_at_k", None) is not None
+                else None
+            )
+            sft_sample.teacher_tokens = None
+            sft_sample.teacher_prompt_length = None
+            sft_sample.metadata = dict(sft_sample.metadata or {})
+            sft_sample.metadata["opd_teacher_sft"] = True
+            sft_sample.metadata["opd_teacher_sft_source_index"] = sample.index
+            samples.append(sft_sample)
+            sft_raw_rewards.append(0.0)
+            sft_scalar_rewards.append(0.0)
+
+    # Interleave SFT samples with their source originals so that every
+    # training mini-batch contains a mix of student and SFT samples.
+    # Without this, all SFT samples land at the end of the list and entire
+    # training steps see only student samples (opd_teacher_sft_loss = 0).
+    if sft_raw_rewards:
+        n_orig = len(original_samples)
+        orig_samples = samples[:n_orig]
+        sft_samples = samples[n_orig:]
+        orig_raw = raw_rewards[:]  # n_orig entries, not yet extended
+        # Interleave: orig_0, sft_0, orig_1, sft_1, ...
+        # zip stops at the shorter list; trailing originals are appended after.
+        interleaved_samples = [s for pair in zip(orig_samples, sft_samples) for s in pair]
+        interleaved_samples.extend(orig_samples[len(sft_samples):])
+        interleaved_raw = [r for pair in zip(orig_raw, sft_raw_rewards) for r in pair]
+        interleaved_raw.extend(orig_raw[len(sft_raw_rewards):])
+        samples[:] = interleaved_samples
+        raw_rewards[:] = interleaved_raw
+        sft_raw_rewards = []
+        sft_scalar_rewards = []
+
     # Return scalar rewards for GRPO/PPO advantage estimator.
     # When --opd-zero-task-reward is enabled, task rewards are zeroed so training
     # is driven by OPD KL only. Otherwise use raw task rewards.
@@ -840,5 +1064,7 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
         scalar_rewards = [0.0] * len(samples)
     else:
         scalar_rewards = list(raw_rewards)
+        scalar_rewards.extend(sft_scalar_rewards)
+    raw_rewards.extend(sft_raw_rewards)
 
     return raw_rewards, scalar_rewards

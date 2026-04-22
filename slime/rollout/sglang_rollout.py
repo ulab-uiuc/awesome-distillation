@@ -297,7 +297,9 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "return_logprob": True,
     }
     use_opd_sglang = args.use_opd and getattr(args, "opd_type", None) == "sglang"
-    use_topk_kl = use_opd_sglang and getattr(args, "opd_kl_mode", "token_reverse_kl") == "full_vocab_topk_reverse_kl"
+    use_topk_kl = use_opd_sglang and getattr(args, "opd_kl_mode", "token_reverse_kl") in (
+        "full_vocab_topk_reverse_kl", "topk_reverse_kl_notail", "topk_reverse_kl_notail_sg"
+    )
     diag_enabled = use_opd_sglang and getattr(args, "opd_token_stats", False)
     requested_topk = []
     if use_topk_kl:
@@ -461,6 +463,7 @@ async def generate_and_rm(
                         args,
                         sample,
                         use_custom_rm=_should_use_custom_rm(args, sample, evaluation=True),
+                        evaluation=True,
                     )
                     for sample in samples_need_reward
                 ]
@@ -479,6 +482,7 @@ async def generate_and_rm(
                 args,
                 sample,
                 use_custom_rm=_should_use_custom_rm(args, sample, evaluation=evaluation),
+                evaluation=evaluation,
             )
 
     return sample

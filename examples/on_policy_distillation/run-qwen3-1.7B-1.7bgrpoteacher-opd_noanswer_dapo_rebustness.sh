@@ -17,14 +17,14 @@
 #     --opd-kl-mode full_vocab_topk_reverse_kl --opd-topk 50
 
 OPD_KL_MODE="token_reverse_kl"
-OPD_TOPK="20"
-OPD_EXPLICIT_LOSS_COEF="1.0"
+OPD_TOPK="1"
+OPD_EXPLICIT_LOSS_COEF="0.0"
 OPD_DISTILL_MAX_RESPONSE_LEN="${OPD_DISTILL_MAX_RESPONSE_LEN:-8192}"
-OPD_TOKEN_STATS="${OPD_TOKEN_STATS:-0}"
-OPD_TOKEN_STATS_TOPK="${OPD_TOKEN_STATS_TOPK:-20}"
+OPD_TOKEN_STATS="${OPD_TOKEN_STATS:-1}"
+OPD_TOKEN_STATS_TOPK="${OPD_TOKEN_STATS_TOPK:-1}"
 OPD_TOKEN_STATS_REPEAT_NGRAM="${OPD_TOKEN_STATS_REPEAT_NGRAM:-3}"
 OPD_TOKEN_STATS_EOS_TOKEN_ID="${OPD_TOKEN_STATS_EOS_TOKEN_ID:-151645}"
-OPD_TEACHER_SFT="${OPD_TEACHER_SFT:-1}"
+OPD_TEACHER_SFT="${OPD_TEACHER_SFT:-0}"
 OPD_TEACHER_SFT_LOSS_COEF="${OPD_TEACHER_SFT_LOSS_COEF:-1.0}"
 OPD_TEACHER_SFT_TEMPERATURE="${OPD_TEACHER_SFT_TEMPERATURE:-0.5}"
 OPD_TEACHER_SFT_TOP_P="${OPD_TEACHER_SFT_TOP_P:-0.95}"
@@ -70,13 +70,16 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Supported args: --opd-kl-mode <token_reverse_kl|full_vocab_topk_reverse_kl> --opd-topk <int> --opd-explicit-loss-coef <float> --opd-distill-max-response-len <-1|int> --opd-teacher-sft [--opd-teacher-sft-loss-coef <float>] [--opd-teacher-sft-temperature <float>] [--opd-teacher-sft-top-p <float>] [--opd-teacher-sft-max-response-len <int>]"
+            echo "Supported args: --opd-kl-mode <token_reverse_kl|full_vocab_topk_reverse_kl|topk_reverse_kl_notail|topk_reverse_kl_notail_sg> --opd-topk <int> --opd-explicit-loss-coef <float> --opd-distill-max-response-len <-1|int> --opd-teacher-sft [--opd-teacher-sft-loss-coef <float>] [--opd-teacher-sft-temperature <float>] [--opd-teacher-sft-top-p <float>] [--opd-teacher-sft-max-response-len <int>]"
             exit 1
             ;;
     esac
 done
 
-if [[ "${OPD_KL_MODE}" != "token_reverse_kl" && "${OPD_KL_MODE}" != "full_vocab_topk_reverse_kl" ]]; then
+if [[ "${OPD_KL_MODE}" != "token_reverse_kl" && \
+      "${OPD_KL_MODE}" != "full_vocab_topk_reverse_kl" && \
+      "${OPD_KL_MODE}" != "topk_reverse_kl_notail" && \
+      "${OPD_KL_MODE}" != "topk_reverse_kl_notail_sg" ]]; then
     echo "Invalid --opd-kl-mode: ${OPD_KL_MODE}"
     exit 1
 fi
@@ -156,7 +159,7 @@ export PYTHONBUFFERED=16
 
 TEACHER_IP="0.0.0.0"
 TEACHER_PORT="${TEACHER_PORT:-30086}"
-TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-Qwen/Qwen3-8B}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-output/Qwen3-1.7B_opsd_masked_grpo_dapo_hf}"
 TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-7}"
 TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.70}"
 RM_MAX_CONCURRENCY="${RM_MAX_CONCURRENCY:-32}"
@@ -352,7 +355,7 @@ GRPO_ARGS=(
    --advantage-estimator grpo
    --use-opd
    --opd-type sglang
-   --opd-kl-coef 0.0
+   --opd-kl-coef 1.0
    --opd-kl-mode "${OPD_KL_MODE}"
    --opd-topk "${OPD_TOPK}"
    --opd-explicit-loss-coef "${OPD_EXPLICIT_LOSS_COEF}"
@@ -378,7 +381,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-1.7bgrpoteacher-opd-noanswer-dapo
+   --wandb-group qwen3-1.7B-1.7bgrpoteacher-opd-noanswer-dapo-OPDinPG
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 

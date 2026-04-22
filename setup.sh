@@ -137,7 +137,7 @@ CUDA_VISIBLE_DEVICES=4 python3 -m sglang.launch_server --model-path Qwen/Qwen3-8
 CUDA_VISIBLE_DEVICES=4,5,7,8 python3 -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30001 --host 0.0.0.0 --tp 4
 
 
-kill -9 $(lsof -t -i :30001)
+kill -9 $(lsof -t -i :30086)
 
 python examples/on_policy_distillation/plot_token_winner_interactive.py \                                                             
     --input ./eval_math500_student_teacher_inference.jsonl \
@@ -228,4 +228,4 @@ python3 tools/convert_torch_dist_to_hf.py \
 CUDA_VISIBLE_DEVICES=2 python3 -m sglang.launch_server --model-path output/Qwen3-1.7B_openthoughts_sft_step198 --port 30000 --host 0.0.0.0 --tp 1
 
 
-CUDA_VISIBLE_DEVICES=2,3 python3 -m sglang.launch_server --model-path output/Qwen3-1.7B_opsd_masked_grpo_dapo_hf --port 30006 --host 0.0.0.0 --tp 2
+CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path output/Qwen3-1.7B_opsd_masked_grpo_dapo_hf --port 30006 --host 0.0.0.0 --tp 1

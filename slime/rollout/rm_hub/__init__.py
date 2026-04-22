@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import random
 
 import aiohttp
@@ -30,7 +31,10 @@ async def remote_rm(args, sample: Sample):
 async def async_rm(args, sample: Sample, use_custom_rm: bool = True, **kwargs):
     if use_custom_rm and args.custom_rm_path is not None:
         rm_function = load_function(args.custom_rm_path)
-        return await rm_function(args, sample, **kwargs)
+        signature = inspect.signature(rm_function)
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
+        supported_kwargs = kwargs if accepts_kwargs else {k: v for k, v in kwargs.items() if k in signature.parameters}
+        return await rm_function(args, sample, **supported_kwargs)
 
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     rm_type = (metadata.get("rm_type") or args.rm_type or "").strip()
@@ -83,7 +87,10 @@ async def batched_async_rm(
     if use_custom_rm and args.custom_rm_path is not None:
         # Ensure the custom reward function is implemented in batch mode
         rm_function = load_function(args.custom_rm_path)
-        return await rm_function(args, samples, **kwargs)
+        signature = inspect.signature(rm_function)
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
+        supported_kwargs = kwargs if accepts_kwargs else {k: v for k, v in kwargs.items() if k in signature.parameters}
+        return await rm_function(args, samples, **supported_kwargs)
     tasks = [async_rm(args, sample, use_custom_rm=use_custom_rm, **kwargs) for sample in samples]
     rewards = await asyncio.gather(*tasks)
     return rewards

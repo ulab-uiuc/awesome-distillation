@@ -813,6 +813,7 @@ def train_one_step(
                 "max_seq_lens",
                 "teacher_log_probs",
                 "opd_distill_sample_mask",
+                "opd_sft_sample_mask",
                 "opd_topk_token_ids",
                 "opd_topk_teacher_log_probs",
                 "opd_diag_topk_overlap",
