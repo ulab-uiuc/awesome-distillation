@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # OPD-SGLang noanswer: external 8B teacher without privileged answer hint
-# Training dataset: BytedTsinghua-SIA/DAPO-Math-17k
+# Training dataset: open-thoughts/OpenThoughts-114k (math filtered)
 #
 # Teacher mode (OPD-SGLang): same_as_student
 #   - Student: original problem, enable_thinking=False (no <think> in response)
@@ -224,17 +224,15 @@ PREPROCESS="python3 examples/on_policy_distillation/preprocess_dataset.py"
 
 # ---- Training dataset -------------------------------------------------------
 
-TRAIN_DATASET="${TRAIN_DATASET:-BytedTsinghua-SIA/DAPO-Math-17k}"
-TRAIN_CONFIG="${TRAIN_CONFIG:-}"   # DAPO does not require a config subset
-TRAIN_OUT="/root/math/data/train_dapo.jsonl"
+TRAIN_OUT="/root/math/data/train_openthoughts_math.jsonl"
 
 # EVAL datasets use boxed by default.
 TRAIN_ANSWER_FORMAT="${TRAIN_ANSWER_FORMAT:-boxed}"
 EVAL_ANSWER_FORMAT="${EVAL_ANSWER_FORMAT:-boxed}"
 
-TRAIN_ARGS=(--dataset "$TRAIN_DATASET" --split train --output "$TRAIN_OUT" --answer-format "$TRAIN_ANSWER_FORMAT")
-[ -n "$TRAIN_CONFIG" ] && TRAIN_ARGS+=(--config "$TRAIN_CONFIG")
-$PREPROCESS "${TRAIN_ARGS[@]}"
+python3 examples/on_policy_distillation/filter_openthoughts_math.py \
+    --output "$TRAIN_OUT" \
+    --answer-format "$TRAIN_ANSWER_FORMAT"
 
 
 # ---- Eval datasets ----------------------------------------------------------
@@ -252,7 +250,7 @@ $PREPROCESS --dataset HuggingFaceH4/MATH-500     --split test  --output /root/ma
 CKPT_ARGS=(
    --hf-checkpoint Qwen/Qwen3-1.7B
    --ref-load "/root/checkpoints_siqi/Qwen3-1.7B_torch_dist"
-   --save "${OPD_SAVE:-/root/slime_siqi/output/Qwen3-1.7B_8B_opd_noanswer_dapo/}"
+   --save "${OPD_SAVE:-/root/slime_siqi/output/Qwen3-1.7B_8B_opd_noanswer_openthoughts/}"
    --save-interval 2000
 )
 if [[ -n "${OPD_LOAD:-}" ]]; then
@@ -381,7 +379,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-1.7bPIgrpoteacher-opd-dapo-nograd_reversekl_top20
+   --wandb-group qwen3-1.7B-1.7bPIgrpoteacher-opd-openthoughts-nograd_reversekl_top20
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
