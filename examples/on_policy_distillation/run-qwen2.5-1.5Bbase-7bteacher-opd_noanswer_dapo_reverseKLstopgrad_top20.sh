@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # OPD-SGLang noanswer: external 8B teacher without privileged answer hint
-# Training dataset: open-thoughts/OpenThoughts-114k (math filtered)
+# Training dataset: BytedTsinghua-SIA/DAPO-Math-17k
 #
 # Teacher mode (OPD-SGLang): same_as_student
 #   - Student: original problem, enable_thinking=False (no <think> in response)
@@ -16,10 +16,10 @@
 #   bash examples/on_policy_distillation/run-qwen3-1.7B-8b-opd_noanswer_dapo.sh \
 #     --opd-kl-mode full_vocab_topk_reverse_kl --opd-topk 50
 
-OPD_KL_MODE="topk_reverse_kl_intersect_sg_norm"
+OPD_KL_MODE="topk_reverse_kl_notail_sg"
 OPD_TOPK="20"
 OPD_EXPLICIT_LOSS_COEF="1.0"
-OPD_DISTILL_MAX_RESPONSE_LEN="${OPD_DISTILL_MAX_RESPONSE_LEN:-8192}"
+OPD_DISTILL_MAX_RESPONSE_LEN="${OPD_DISTILL_MAX_RESPONSE_LEN:-1024}"
 OPD_TOKEN_STATS="${OPD_TOKEN_STATS:-1}"
 OPD_TOKEN_STATS_TOPK="${OPD_TOKEN_STATS_TOPK:-20}"
 OPD_TOKEN_STATS_REPEAT_NGRAM="${OPD_TOKEN_STATS_REPEAT_NGRAM:-3}"
@@ -70,7 +70,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Supported args: --opd-kl-mode <token_reverse_kl|full_vocab_topk_reverse_kl|topk_reverse_kl_notail|topk_reverse_kl_notail_sg|topk_reverse_kl_intersect_sg_norm> --opd-topk <int> --opd-explicit-loss-coef <float> --opd-distill-max-response-len <-1|int> --opd-teacher-sft [--opd-teacher-sft-loss-coef <float>] [--opd-teacher-sft-temperature <float>] [--opd-teacher-sft-top-p <float>] [--opd-teacher-sft-max-response-len <int>]"
+            echo "Supported args: --opd-kl-mode <token_reverse_kl|full_vocab_topk_reverse_kl|topk_reverse_kl_notail|topk_reverse_kl_notail_sg> --opd-topk <int> --opd-explicit-loss-coef <float> --opd-distill-max-response-len <-1|int> --opd-teacher-sft [--opd-teacher-sft-loss-coef <float>] [--opd-teacher-sft-temperature <float>] [--opd-teacher-sft-top-p <float>] [--opd-teacher-sft-max-response-len <int>]"
             exit 1
             ;;
     esac
@@ -160,9 +160,9 @@ export PYTHONBUFFERED=16
 
 TEACHER_IP="0.0.0.0"
 TEACHER_PORT="${TEACHER_PORT:-30086}"
-TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-Qwen/Qwen3-8B}"
-TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-6}"
-TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.70}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-/root/checkpoints_siqi/models--Qwen--Qwen2.5-Math-7B-Instruct}"
+TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-1}"
+TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.80}"
 RM_MAX_CONCURRENCY="${RM_MAX_CONCURRENCY:-64}"
 TEACHER_LOG_FILE="/tmp/sglang_teacher_qwen3_8b_$(date +%s).log"
 TEACHER_STARTED_BY_SCRIPT=0
@@ -215,7 +215,7 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-source "/root/slime_siqi/scripts/models/qwen3-1.7B.sh"
+source "/root/slime_siqi/scripts/models/qwen2.5-1.5B.sh"
 
 ###############################################################################
 # Step 0: Preprocess datasets
@@ -225,15 +225,17 @@ PREPROCESS="python3 examples/on_policy_distillation/preprocess_dataset.py"
 
 # ---- Training dataset -------------------------------------------------------
 
-TRAIN_OUT="/root/math/data/train_openthoughts_math.jsonl"
+TRAIN_DATASET="${TRAIN_DATASET:-BytedTsinghua-SIA/DAPO-Math-17k}"
+TRAIN_CONFIG="${TRAIN_CONFIG:-}"   # DAPO does not require a config subset
+TRAIN_OUT="/root/math/data/train_dapo.jsonl"
 
 # EVAL datasets use boxed by default.
 TRAIN_ANSWER_FORMAT="${TRAIN_ANSWER_FORMAT:-boxed}"
 EVAL_ANSWER_FORMAT="${EVAL_ANSWER_FORMAT:-boxed}"
 
-python3 examples/on_policy_distillation/filter_openthoughts_math.py \
-    --output "$TRAIN_OUT" \
-    --answer-format "$TRAIN_ANSWER_FORMAT"
+TRAIN_ARGS=(--dataset "$TRAIN_DATASET" --split train --output "$TRAIN_OUT" --answer-format "$TRAIN_ANSWER_FORMAT")
+[ -n "$TRAIN_CONFIG" ] && TRAIN_ARGS+=(--config "$TRAIN_CONFIG")
+$PREPROCESS "${TRAIN_ARGS[@]}"
 
 
 # ---- Eval datasets ----------------------------------------------------------
@@ -249,9 +251,9 @@ $PREPROCESS --dataset HuggingFaceH4/MATH-500     --split test  --output /root/ma
 ###############################################################################
 
 CKPT_ARGS=(
-   --hf-checkpoint Qwen/Qwen3-1.7B
-   --ref-load "/root/checkpoints_siqi/Qwen3-1.7B_torch_dist"
-   --save "${OPD_SAVE:-/root/slime_siqi/output/Qwen3-1.7B_8B_opd_noanswer_openthoughts/}"
+   --hf-checkpoint /root/checkpoints_siqi/Qwen2.5-1.5B
+   --ref-load "/root/checkpoints_siqi/Qwen2.5-1.5B_torch_dist"
+   --save "${OPD_SAVE:-/root/slime_siqi/output/Qwen2.5-1.5B_7B_opd_noanswer_dapo/}"
    --save-interval 2000
 )
 if [[ -n "${OPD_LOAD:-}" ]]; then
@@ -274,7 +276,7 @@ fi
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-64}"
 OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-64}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
-ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-4096}"
+ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-1024}"
 ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.95}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-2048}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.85}"
@@ -283,7 +285,7 @@ SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-256}"
 SGLANG_CHUNKED_PREFILL_SIZE="${SGLANG_CHUNKED_PREFILL_SIZE:-2048}"
 SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-1}"
 LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-128}"
-EVAL_CONFIG_PATH="${EVAL_CONFIG_PATH:-examples/on_policy_distillation/eval_config.yaml}"
+EVAL_CONFIG_PATH="${EVAL_CONFIG_PATH:-examples/on_policy_distillation/eval_config_4k.yaml}"
 OPD_TEACHER_SFT_MAX_RESPONSE_LEN="${OPD_TEACHER_SFT_MAX_RESPONSE_LEN:-${ROLLOUT_MAX_RESPONSE_LEN}}"
 
 TEACHER_SFT_ARGS=()
@@ -331,7 +333,7 @@ EVAL_ARGS=(
     --eval-config "${EVAL_CONFIG_PATH}"
     --log-passrate
     --save-debug-rollout-data /root/slime_siqi/output/debug_rollout/{rollout_id}.pt
-    --skip-eval-before-train
+    # --skip-eval-before-train
 )
 
 PERF_ARGS=(
@@ -380,7 +382,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group run-qwen3-1.7B-8bteacher-opd_noanswer_opengthoughts_reverseKLnorm_nograd_top20
+   --wandb-group run-qwen2.5-1.5Bbase-7bteacher-opd_noanswer_dapo_reverseKLstopgrad_top20
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -411,7 +413,7 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=7,8,9
+export CUDA_VISIBLE_DEVICES=2,4,5
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 3 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 set +e
@@ -422,7 +424,7 @@ ray job submit --submission-id "${RAY_JOB_ID}" --address="http://127.0.0.1:8265"
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "7,8,9"
+        "CUDA_VISIBLE_DEVICES": "2,4,5"
      }
    }' \
    -- python3 train.py \

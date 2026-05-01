@@ -208,7 +208,7 @@ curl http://localhost:30006/v1/chat/completions \
     ],
     "temperature": 0.6,
     "chat_template_kwargs": {
-      "enable_thinking": false
+      "enable_thinking": true
     }
   }'
 
@@ -225,7 +225,17 @@ python3 tools/convert_torch_dist_to_hf.py \
   --origin-hf-dir /root/checkpoints_siqi/Qwen3-1.7B
 
 
+
+python3 tools/convert_torch_dist_to_hf.py \
+  --input-dir /root/slime_siqi/output/Qwen2.5-1.5B-base_sft_qwen25math7b_openthoughts_math/iter_0000138 \
+  --output-dir /root/checkpoints_siqi/Qwen2.5-Math-1.5B-sftstep138 \
+  --origin-hf-dir /root/checkpoints_siqi/models--Qwen--Qwen2.5-Math-1.5B
+
+
+
 CUDA_VISIBLE_DEVICES=2 python3 -m sglang.launch_server --model-path output/Qwen3-1.7B_openthoughts_sft_step198 --port 30000 --host 0.0.0.0 --tp 1
 
 
 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path output/Qwen3-1.7B_opsd_masked_grpo_dapo_hf --port 30006 --host 0.0.0.0 --tp 1
+CUDA_VISIBLE_DEVICES=0 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/models--Qwen--Qwen2.5-Math-7B-Instruct --port 30006 --host 0.0.0.0 --tp 1
+CUDA_VISIBLE_DEVICES=9 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/models--Qwen--Qwen3-4B-Instruct-2507 --port 30006 --host 0.0.0.0 --tp 1

@@ -1,6 +1,8 @@
-"""Collect Qwen3-generated SFT conversations for OpenThoughts math prompts.
+"""Collect LLM-generated SFT conversations for OpenThoughts math prompts.
 
-This script mirrors ``filter_openthoughts_math_sft.py`` for prompt selection:
+Supports Qwen2.5-Math-7B-Instruct (default) and other OpenAI-compatible models.
+
+Prompt pre-filtering mirrors ``filter_openthoughts_math_sft.py``:
 
   1. keep only rows with ``domain == "math"``;
   2. read the reference solution from ``ground_truth_solution`` with
@@ -9,9 +11,9 @@ This script mirrors ``filter_openthoughts_math_sft.py`` for prompt selection:
      answer;
   4. skip rows with an empty problem.
 
-Unlike ``filter_openthoughts_math_sft.py``, the assistant message is generated
-through an OpenAI-compatible ``/chat/completions`` API. The generated response
-must contain exactly one extractable ``\\boxed{...}`` answer to be written.
+Generated responses are validated with ``is_valid_output``: they must contain
+``\\boxed{}`` and must not exhibit repeated-line, n-gram, or consecutive-block
+repetition patterns.
 
 Supported output suffixes are ``.parquet`` and ``.jsonl``.
 """
@@ -19,16 +21,32 @@ Supported output suffixes are ``.parquet`` and ``.jsonl``.
 
 
 """python3 examples/on_policy_distillation/collect_qwen3_llm_sft_openthoughts_math.py \
-  --output /root/math/data/sft_qwen3_1p7b_generated_openthoughts_math.parquet \
+  --output /root/math/data/sft_qwen25math_7b_generated_openthoughts_math.parquet \
   --api-base http://localhost:30006/v1 \
   --api-key EMPTY \
-  --model your-model-name \
-  --enable-thinking false \
-  --max-tokens 4096 \
+  --model Qwen2.5-Math-7B-Instruct \
+  --max-tokens 8192 \
   --temperature 0.7 \
   --top-p 0.95 \
   --concurrency 16 \
   --max-samples 10
+
+  
+标准模式（行为与 Qwen2.5 一致）：                                                                              
+python3 examples/on_policy_distillation/collect_qwen3_llm_sft_openthoughts_math.py \
+    --output /root/math/data/sft_qwen3_4b_math.parquet \
+    --api-base http://localhost:30006/v1 \
+    --api-key EMPTY \
+    --model Qwen3-4B-Thinking-2507 \
+    --concurrency 512 \
+    --max-samples 1 \
+    --enable-thinking False
+                                                                                                                 
+  开启 thinking，保留 <think> 标签（SFT 训练推理能力）：                                                         
+    --enable-thinking True                                                                                       
+                                                                                                                 
+  开启 thinking，但去掉 <think> 标签（只保留最终答案）：                                                         
+    --enable-thinking True --strip-thinking True
 """
 import argparse
 import asyncio
@@ -66,6 +84,83 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
+_QWEN25MATH_SYSTEM_PROMPT = (
+    "Please reason step by step, and put your final answer within \\boxed{}."
+)
+
+# Qwen3 does not require a special math system prompt; use empty by default.
+_QWEN3_SYSTEM_PROMPT = ""
+
+
+# ---------------------------------------------------------------------------
+# Output quality filters
+# ---------------------------------------------------------------------------
+
+def has_boxed(text: str) -> bool:
+    """Check if output contains \\boxed{}."""
+    return "\\boxed" in text
+
+
+def detect_repeated_lines(text: str, min_len: int = 20, threshold: int = 5) -> bool:
+    """Detect if any line (len >= min_len) appears >= threshold times."""
+    lines = [line.strip() for line in text.split("\n") if len(line.strip()) >= min_len]
+    if not lines:
+        return False
+    counter = Counter(lines)
+    return counter.most_common(1)[0][1] >= threshold
+
+
+def detect_ngram_repetition(text: str, n: int = 100, threshold: int = 3) -> bool:
+    """Detect if any n-char substring appears >= threshold times (sliding window)."""
+    if len(text) < n * threshold:
+        return False
+    seen: dict[str, int] = {}
+    for i in range(0, len(text) - n + 1, 10):
+        chunk = text[i : i + n]
+        seen[chunk] = seen.get(chunk, 0) + 1
+        if seen[chunk] >= threshold:
+            return True
+    return False
+
+
+def detect_consecutive_repeat(text: str, block_size: int = 50, threshold: int = 3) -> bool:
+    """Detect if a consecutive block (>= block_size chars) repeats >= threshold times in a row."""
+    if len(text) < block_size * threshold:
+        return False
+    for i in range(len(text) - block_size * threshold + 1):
+        block = text[i : i + block_size]
+        count = 1
+        pos = i + block_size
+        while pos + block_size <= len(text) and text[pos : pos + block_size] == block:
+            count += 1
+            pos += block_size
+            if count >= threshold:
+                return True
+    return False
+
+
+def strip_thinking(text: str) -> str:
+    """Remove leading <think>...</think> block produced by Qwen3 thinking mode."""
+    import re
+    return re.sub(r"^\s*<think>.*?</think>\s*", "", text, count=1, flags=re.DOTALL)
+
+
+def is_valid_output(text: str) -> tuple[bool, str]:
+    """Return (is_valid, reason). Reject outputs missing \\boxed{} or with repetitive text."""
+    if not has_boxed(text):
+        return False, "no_boxed"
+    if detect_repeated_lines(text):
+        return False, "repeated_lines"
+    if detect_ngram_repetition(text):
+        return False, "ngram_repetition"
+    if len(text) > 5000 and detect_consecutive_repeat(text):
+        return False, "consecutive_repeat"
+    return True, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Candidate:
@@ -84,6 +179,10 @@ class GenerationResult:
     error: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _parse_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -100,6 +199,75 @@ def _chat_completions_url(api_base: str) -> str:
     if base.endswith("/chat/completions"):
         return base
     return f"{base}/chat/completions"
+
+
+def _fetch_server_info(api_base: str, api_key: str) -> tuple[int | None, str | None]:
+    """Query /v1/models for (max_model_len, model_root_path). Returns (None, None) on failure."""
+    import urllib.request
+    base = api_base.rstrip("/")
+    if base.endswith("/chat/completions"):
+        base = base[: -len("/chat/completions")]
+    url = f"{base}/models"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        for entry in data.get("data", []):
+            max_len = entry.get("max_model_len")
+            root = entry.get("root") or entry.get("id")
+            if max_len:
+                return int(max_len), root
+    except Exception:
+        pass
+    return None, None
+
+
+def _filter_by_length(
+    candidates: list[Candidate],
+    *,
+    model_path: str,
+    system_prompt: str,
+    max_tokens: int,
+    max_model_len: int,
+) -> tuple[list[Candidate], int]:
+    """Remove candidates whose tokenized input + max_tokens would exceed max_model_len."""
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        logger.warning("transformers not installed; skipping length pre-filter.")
+        return candidates, 0
+
+    try:
+        tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    except Exception as e:
+        logger.warning(f"Could not load tokenizer from {model_path!r}: {e}; skipping length pre-filter.")
+        return candidates, 0
+
+    budget = max_model_len - max_tokens
+    if budget <= 0:
+        raise ValueError(
+            f"max_tokens={max_tokens} >= max_model_len={max_model_len}; "
+            "lower --max-tokens so there is room for the prompt."
+        )
+
+    kept: list[Candidate] = []
+    skipped = 0
+    for c in candidates:
+        messages: list[dict] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": c.student_user_content})
+        try:
+            ids = tok.apply_chat_template(messages, add_generation_prompt=True)
+            n_tokens = len(ids)
+        except Exception:
+            # Fallback: rough char-based estimate (4 chars ≈ 1 token)
+            n_tokens = sum(len(m["content"]) for m in messages) // 4
+        if n_tokens <= budget:
+            kept.append(c)
+        else:
+            skipped += 1
+    return kept, skipped
 
 
 def _write_records(output: str, records: list[dict]) -> None:
@@ -123,6 +291,10 @@ def _write_records(output: str, records: list[dict]) -> None:
 
     raise ValueError(f"Unsupported output suffix {output_path.suffix!r}; use .parquet or .jsonl.")
 
+
+# ---------------------------------------------------------------------------
+# Prompt loading
+# ---------------------------------------------------------------------------
 
 def _load_candidates(answer_format: str, max_samples: int | None) -> tuple[list[Candidate], Counter, dict[str, int]]:
     try:
@@ -195,26 +367,39 @@ def _load_candidates(answer_format: str, max_samples: int | None) -> tuple[list[
     return candidates, domain_counts, stats
 
 
+# ---------------------------------------------------------------------------
+# API generation
+# ---------------------------------------------------------------------------
+
 def _build_payload(
     candidate: Candidate,
     *,
     model: str,
     temperature: float,
     top_p: float,
+    top_k: int | None,
     max_tokens: int,
     seed: int | None,
+    system_prompt: str,
     enable_thinking: bool,
 ) -> dict[str, Any]:
+    messages: list[dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": candidate.student_user_content})
+
     payload: dict[str, Any] = {
         "model": model,
-        "messages": [{"role": "user", "content": candidate.student_user_content}],
+        "messages": messages,
         "temperature": temperature,
         "top_p": top_p,
         "max_tokens": max_tokens,
-        # This is the raw request-body form produced by OpenAI client's
-        # extra_body={"chat_template_kwargs": {"enable_thinking": False}}.
+        # Qwen3: control thinking mode via chat_template_kwargs.
+        # When enable_thinking=False this is a no-op for Qwen2.5-style models.
         "chat_template_kwargs": {"enable_thinking": enable_thinking},
     }
+    if top_k is not None:
+        payload["top_k"] = top_k
     if seed is not None:
         payload["seed"] = seed
     return payload
@@ -229,8 +414,10 @@ async def _generate_one(
     model: str,
     temperature: float,
     top_p: float,
+    top_k: int | None,
     max_tokens: int,
     seed: int | None,
+    system_prompt: str,
     enable_thinking: bool,
     retries: int,
 ) -> GenerationResult:
@@ -239,8 +426,10 @@ async def _generate_one(
         model=model,
         temperature=temperature,
         top_p=top_p,
+        top_k=top_k,
         max_tokens=max_tokens,
         seed=seed,
+        system_prompt=system_prompt,
         enable_thinking=enable_thinking,
     )
 
@@ -277,8 +466,10 @@ async def _generate_all(
     model: str,
     temperature: float,
     top_p: float,
+    top_k: int | None,
     max_tokens: int,
     seed: int | None,
+    system_prompt: str,
     enable_thinking: bool,
     concurrency: int,
     retries: int,
@@ -319,8 +510,10 @@ async def _generate_all(
                     model=model,
                     temperature=temperature,
                     top_p=top_p,
+                    top_k=top_k,
                     max_tokens=max_tokens,
                     seed=per_sample_seed,
+                    system_prompt=system_prompt,
                     enable_thinking=enable_thinking,
                     retries=retries,
                 )
@@ -336,17 +529,24 @@ async def _generate_all(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Record building
+# ---------------------------------------------------------------------------
+
 def _build_sft_records(
     candidates: list[Candidate],
     results: list[GenerationResult],
     *,
     api_model: str,
+    do_strip_thinking: bool = False,
 ) -> tuple[list[dict], dict[str, int], list[str]]:
-    stats = {
+    stats: dict[str, int] = {
         "generation_failed": 0,
         "generated_empty": 0,
-        "generated_no_boxed": 0,
-        "generated_multi_boxed": 0,
+        "filtered_no_boxed": 0,
+        "filtered_repeated_lines": 0,
+        "filtered_ngram_repetition": 0,
+        "filtered_consecutive_repeat": 0,
         "written": 0,
     }
     first_errors: list[str] = []
@@ -364,19 +564,21 @@ def _build_sft_records(
             stats["generated_empty"] += 1
             continue
 
-        generated_boxed_answers = _extract_boxed_answers(generated_response)
-        if len(generated_boxed_answers) == 0:
-            stats["generated_no_boxed"] += 1
+        # For Qwen3 thinking mode: validate against the full output (thinking + answer),
+        # then optionally strip the <think> block from what we store.
+        sft_response = strip_thinking(generated_response) if do_strip_thinking else generated_response
+        valid, reason = is_valid_output(sft_response)
+        if not valid:
+            stats[f"filtered_{reason}"] += 1
             continue
-        if len(generated_boxed_answers) > 1:
-            stats["generated_multi_boxed"] += 1
-            continue
+
+        generated_boxed_answers = _extract_boxed_answers(sft_response)
 
         records.append(
             {
                 "messages": [
                     {"role": "user", "content": candidate.student_user_content},
-                    {"role": "assistant", "content": generated_response},
+                    {"role": "assistant", "content": sft_response},
                 ],
                 "label": candidate.label,
                 "metadata": {
@@ -387,8 +589,9 @@ def _build_sft_records(
                     "reference_solution": candidate.reference_solution,
                     "solution": candidate.reference_solution,
                     "format_instruction": candidate.format_instruction,
-                    "generated_response": generated_response,
-                    "generated_boxed_answer": generated_boxed_answers[0],
+                    "generated_response": sft_response,
+                    "raw_generated_response": generated_response,  # full output before stripping
+                    "generated_boxed_answer": generated_boxed_answers[0] if generated_boxed_answers else "",
                     "api_model": api_model,
                 },
             }
@@ -397,6 +600,10 @@ def _build_sft_records(
 
     return records, stats, first_errors
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def collect_qwen3_llm_sft(
     *,
@@ -408,9 +615,12 @@ def collect_qwen3_llm_sft(
     max_samples: int | None,
     temperature: float,
     top_p: float,
+    top_k: int | None,
     max_tokens: int,
     seed: int | None,
+    system_prompt: str,
     enable_thinking: bool,
+    strip_thinking_output: bool,
     concurrency: int,
     retries: int,
     timeout: float,
@@ -443,14 +653,35 @@ def collect_qwen3_llm_sft(
     if not candidates:
         raise RuntimeError("No candidate prompts found; no output written.")
 
+    # Query the server for max_model_len and pre-filter prompts that are too long.
+    max_model_len, model_root = _fetch_server_info(api_base, api_key)
+    if max_model_len is not None:
+        logger.info(f"\nServer max_model_len={max_model_len}; filtering prompts where input + {max_tokens} > {max_model_len}.")
+        candidates, n_skipped_len = _filter_by_length(
+            candidates,
+            model_path=model_root or model,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            max_model_len=max_model_len,
+        )
+        logger.info(f"  Skipped (too long for context): {n_skipped_len}")
+        logger.info(f"  Remaining after length filter:  {len(candidates)}")
+        if not candidates:
+            raise RuntimeError("All candidates were filtered out as too long; lower --max-tokens or use a larger context server.")
+    else:
+        logger.info("\nCould not fetch max_model_len from server; skipping length pre-filter.")
+
     logger.info("")
     logger.info("=== Generation config ===")
     logger.info(f"  API base:        {api_base}")
     logger.info(f"  Model:           {model}")
-    logger.info(f"  enable_thinking: {enable_thinking}")
+    logger.info(f"  system_prompt:   {system_prompt!r}")
     logger.info(f"  max_tokens:      {max_tokens}")
     logger.info(f"  temperature:     {temperature}")
     logger.info(f"  top_p:           {top_p}")
+    logger.info(f"  top_k:           {top_k}")
+    logger.info(f"  enable_thinking: {enable_thinking}")
+    logger.info(f"  strip_thinking:  {strip_thinking_output}")
     logger.info(f"  concurrency:     {concurrency}")
     logger.info(f"  retries:         {retries}")
 
@@ -462,34 +693,40 @@ def collect_qwen3_llm_sft(
             model=model,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             max_tokens=max_tokens,
             seed=seed,
+            system_prompt=system_prompt,
             enable_thinking=enable_thinking,
             concurrency=concurrency,
             retries=retries,
             timeout=timeout,
         )
     )
-    records, generation_stats, first_errors = _build_sft_records(candidates, results, api_model=model)
+    records, generation_stats, first_errors = _build_sft_records(
+        candidates, results, api_model=model, do_strip_thinking=strip_thinking_output
+    )
 
     if not records:
-        raise RuntimeError("Generation produced no usable SFT records after boxed-answer filtering; no output written.")
+        raise RuntimeError("Generation produced no usable SFT records after filtering; no output written.")
 
     _write_records(output, records)
 
     logger.info("")
     logger.info("=== Generation filter results ===")
-    logger.info(f"  API failures:                  {generation_stats['generation_failed']}")
-    logger.info(f"  Skipped (empty response):      {generation_stats['generated_empty']}")
-    logger.info(f"  Skipped (no generated boxed):  {generation_stats['generated_no_boxed']}")
-    logger.info(f"  Skipped (multi generated):     {generation_stats['generated_multi_boxed']}")
-    logger.info(f"  Written SFT conversations:     {generation_stats['written']}")
+    logger.info(f"  API failures:                    {generation_stats['generation_failed']}")
+    logger.info(f"  Skipped (empty response):        {generation_stats['generated_empty']}")
+    logger.info(f"  Filtered (no boxed):             {generation_stats['filtered_no_boxed']}")
+    logger.info(f"  Filtered (repeated lines):       {generation_stats['filtered_repeated_lines']}")
+    logger.info(f"  Filtered (ngram repetition):     {generation_stats['filtered_ngram_repetition']}")
+    logger.info(f"  Filtered (consecutive repeat):   {generation_stats['filtered_consecutive_repeat']}")
+    logger.info(f"  Written SFT conversations:       {generation_stats['written']}")
     if first_errors:
         logger.info("")
         logger.info("First generation errors:")
         for error in first_errors:
             logger.info(f"  {error}")
-    logger.info(f"  Output written to:             {output}")
+    logger.info(f"  Output written to:               {output}")
 
 
 def main() -> None:
@@ -499,7 +736,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output",
-        default="/root/math/data/sft_qwen3_1p7b_generated_openthoughts_math.parquet",
+        default="/root/math/data/sft_qwen25math_7b_generated_openthoughts_math.parquet",
         help="Output path ending in .parquet or .jsonl.",
     )
     parser.add_argument(
@@ -514,8 +751,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default=os.environ.get("OPENAI_MODEL", "qwen3-1.7b"),
-        help="Model name sent to /chat/completions. Defaults to OPENAI_MODEL or qwen3-1.7b.",
+        default=os.environ.get("OPENAI_MODEL", "Qwen3-4B-Instruct-2507"),
+        help="Model name sent to /chat/completions. Defaults to OPENAI_MODEL or Qwen3-4B-Instruct-2507.",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        dest="system_prompt",
+        default=_QWEN3_SYSTEM_PROMPT,
+        help=(
+            "System prompt prepended to each conversation. "
+            "Defaults to empty (Qwen3 style). "
+            f"For Qwen2.5-Math pass: {_QWEN25MATH_SYSTEM_PROMPT!r}. "
+            "Pass an empty string to omit the system message."
+        ),
     )
     parser.add_argument(
         "--answer-format",
@@ -535,19 +783,43 @@ def main() -> None:
         help="Stop after preparing N reference-filtered prompts for API generation.",
     )
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature.")
-    parser.add_argument("--top-p", type=float, default=0.95, help="Nucleus sampling probability.")
+    parser.add_argument("--top-p", type=float, default=0.8, help="Nucleus sampling probability (Qwen3 default: 0.8).")
+    parser.add_argument(
+        "--top-k",
+        dest="top_k",
+        type=int,
+        default=20,
+        help="Top-k sampling (Qwen3 default: 20). Pass -1 to omit.",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        dest="enable_thinking",
+        type=_parse_bool,
+        default=False,
+        help=(
+            "Enable Qwen3 thinking mode (<think>...</think> blocks). "
+            "Default False keeps behaviour identical to Qwen2.5. "
+            "When True the full reasoning trace is stored in the SFT data "
+            "unless --strip-thinking is also set."
+        ),
+    )
+    parser.add_argument(
+        "--strip-thinking",
+        dest="strip_thinking",
+        type=_parse_bool,
+        default=False,
+        help=(
+            "Strip <think>...</think> blocks from stored assistant content. "
+            "Only meaningful when --enable-thinking=True. "
+            "When False (default) the thinking trace is kept in the SFT record."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=4096, help="Maximum generated tokens per response.")
     parser.add_argument(
         "--seed",
         type=int,
         default=1234,
         help="Base seed. Per-sample seed is base seed plus candidate index. Use --seed -1 to omit seed.",
-    )
-    parser.add_argument(
-        "--enable-thinking",
-        type=_parse_bool,
-        default=False,
-        help="Value for chat_template_kwargs.enable_thinking. Defaults to false.",
     )
     parser.add_argument("--concurrency", type=int, default=16, help="Max in-flight API requests.")
     parser.add_argument("--retries", type=int, default=2, help="Retries per request after the first attempt.")
@@ -571,6 +843,7 @@ def main() -> None:
         raise ValueError("--timeout must be positive.")
 
     seed = None if args.seed == -1 else args.seed
+    top_k = None if args.top_k == -1 else args.top_k
     collect_qwen3_llm_sft(
         output=args.output,
         api_base=args.api_base,
@@ -580,9 +853,12 @@ def main() -> None:
         max_samples=args.max_samples,
         temperature=args.temperature,
         top_p=args.top_p,
+        top_k=top_k,
         max_tokens=args.max_tokens,
         seed=seed,
+        system_prompt=args.system_prompt,
         enable_thinking=args.enable_thinking,
+        strip_thinking_output=args.strip_thinking,
         concurrency=args.concurrency,
         retries=args.retries,
         timeout=args.timeout,

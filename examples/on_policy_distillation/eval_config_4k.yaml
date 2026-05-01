@@ -1,0 +1,27 @@
+# Eval config for models with 4096 max_position_embeddings (e.g., Qwen2.5-Math-1.5B).
+# max_response_len=3072 leaves ~1024 tokens for the prompt, staying within the 4096 context window.
+# See eval_config.yaml for models with 32K+ context.
+eval:
+  defaults:
+    max_response_len: 3072
+    top_p: 0.95
+    temperature: 0.6
+  datasets:
+    - name: aime24
+      path: /root/math/data/eval_aime24.jsonl
+      rm_type: math
+      n_samples_per_eval_prompt: 1
+      apply_chat_template_kwargs:
+        enable_thinking: false
+    - name: aime25
+      path: /root/math/data/eval_aime25.jsonl
+      rm_type: math
+      n_samples_per_eval_prompt: 1
+      apply_chat_template_kwargs:
+        enable_thinking: false
+    - name: math500
+      path: /root/math/data/eval_math500.jsonl
+      rm_type: math
+      n_samples_per_eval_prompt: 1
+      apply_chat_template_kwargs:
+        enable_thinking: false

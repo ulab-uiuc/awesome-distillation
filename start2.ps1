@@ -57,14 +57,14 @@ hf download Qwen/Qwen2.5-1.5B-Instruct --local-dir /root/checkpoints_siqi/Qwen2.
 
 # 3. 加载 Qwen3-8B 模型配置
 echo "=== Loading Qwen3-8B model config ==="
-source scripts/models/qwen2.5-1.5B.sh
+source scripts/models/qwen2.5-math-1.5B.sh
 
 # 4. 将 HuggingFace 模型转换为 torch_dist 格式
 echo "=== Converting HF checkpoint to torch_dist format ==="
-CUDA_VISIBLE_DEVICES=3,5,7,9 PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
     ${MODEL_ARGS[@]} \
-    --hf-checkpoint /root/checkpoints_siqi/Qwen2.5-1.5B \
-    --save /root/checkpoints_siqi/Qwen2.5-1.5B_torch_dist
+    --hf-checkpoint /root/checkpoints_siqi/Qwen2.5-Math-1.5B-sftstep138 \
+    --save /root/checkpoints_siqi/Qwen2.5-Math-1.5B-sftstep138_torch_dist
 
 # mkdir -p /root/slime/output/Qwen2.5-1.5B_opsd_slime/
 echo "=== All done! ==="

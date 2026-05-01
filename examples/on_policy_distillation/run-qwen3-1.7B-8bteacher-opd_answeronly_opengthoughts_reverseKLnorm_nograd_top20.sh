@@ -161,7 +161,7 @@ export PYTHONBUFFERED=16
 TEACHER_IP="0.0.0.0"
 TEACHER_PORT="${TEACHER_PORT:-30086}"
 TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-Qwen/Qwen3-8B}"
-TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-6}"
+TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-3}"
 TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.70}"
 RM_MAX_CONCURRENCY="${RM_MAX_CONCURRENCY:-64}"
 TEACHER_LOG_FILE="/tmp/sglang_teacher_qwen3_8b_$(date +%s).log"
@@ -360,7 +360,7 @@ GRPO_ARGS=(
    --opd-explicit-loss-coef "${OPD_EXPLICIT_LOSS_COEF}"
    --opd-distill-max-response-len "${OPD_DISTILL_MAX_RESPONSE_LEN}"
    --opd-zero-task-reward
-   --opd-teacher-info-mode same_as_student
+   --opd-teacher-info-mode answer_only
    --opd-teacher-tokenizer "${TEACHER_MODEL_PATH}"
    ${TEACHER_SFT_ARGS[@]}
    ${TOKEN_STATS_ARGS[@]}
@@ -380,7 +380,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group run-qwen3-1.7B-8bteacher-opd_noanswer_opengthoughts_reverseKLnorm_nograd_top20
+   --wandb-group run-qwen3-1.7B-8bteacher-opd_answeronly_opengthoughts_reverseKLnorm_nograd_top20
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -411,7 +411,7 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=7,8,9
+export CUDA_VISIBLE_DEVICES=5,8,9
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 3 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 set +e
@@ -422,7 +422,7 @@ ray job submit --submission-id "${RAY_JOB_ID}" --address="http://127.0.0.1:8265"
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "7,8,9"
+        "CUDA_VISIBLE_DEVICES": "5,8,9"
      }
    }' \
    -- python3 train.py \

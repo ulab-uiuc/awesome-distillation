@@ -4,10 +4,15 @@
 #
 # For final benchmark evaluation matching the paper results, use opsd_ucla/eval/evaluate_math.py
 # WITHOUT --no_thinking (default enable_thinking=True, max_new_tokens=38912).
+#
+# max_response_len must be < model max_position_embeddings - max_prompt_len.
+# Qwen3-1.7B / Qwen3-8B: 32K context → 16384 is fine.
+# Qwen2.5-1.5B / Qwen2.5-Math-1.5B: 4096 context → use eval_config_4k.yaml instead.
 eval:
   defaults:
     max_response_len: 16384
     top_p: 0.95
+    temperature: 0.6
   datasets:
     - name: aime24
       path: /root/math/data/eval_aime24.jsonl
